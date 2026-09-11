@@ -1,0 +1,14 @@
+# Keep everything users don't need out of the release zip (git archive honors export-ignore).
+#
+# Users get exactly FIVE files:
+#   postmaster/init.lua
+#   postmaster/assets/images/atlas_ledger.png     (1024x1024 POT - non-POT silently breaks every UV)
+#   postmaster/assets/images/wordmark.png         (1024x512 POT, greyscale, tinted per theme)
+#   postmaster/assets/sounds/milestone.wav
+#   postmaster/assets/sounds/alert.wav
+#
+# README.md stays TRACKED - it syncs to the RG resource Overview on each release - but does NOT ship.
+.github export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
+README.md export-ignore

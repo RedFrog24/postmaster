@@ -1,0 +1,10 @@
+# Local-only files - never ship to the RedGuides-linked repo.
+# Tracked: init.lua + assets/ (FOUR runtime files) + README.md + the publish workflow. Nothing else.
+*.md
+!README.md
+backup/
+design/
+tools/
+.luacheckrc
+__pycache__/
+*.pyc

@@ -1,0 +1,64 @@
+name: Publish to RedGuides
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g., v1.2.3). This should be a valid git ref (tag, branch, or SHA) that will be checked out."
+        required: true
+        type: string
+      message:
+        description: "Optional update message (plain text). If omitted, we use the GitHub Release body (manual runs try to fetch by tag)."
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"
+
+      - name: Build zip file
+        # --prefix wraps everything in a postmaster/ folder (lowercase - the script binds and loads
+        # assets by that exact name), so extracting into the MQ lua folder just works. Without it the
+        # zip contents were LOOSE at the root and /lua run postmaster found nothing (v1.00 reports).
+        run: git archive --format=zip --prefix=postmaster/ -o "${{ github.event.repository.name }}_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}.zip" HEAD
+
+      - name: Write message from workflow input (manual run)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.message != '' }}
+        env:
+          MESSAGE: ${{ github.event.inputs.message }}
+        run: printf "%s\n" "$MESSAGE" > rg_release_notes.md
+
+      - name: Write message from GitHub Release body
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.message == '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" | jq -r '.body // ""' > rg_release_notes.md
+          else
+            jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" > rg_release_notes.md
+          fi
+
+      - name: Publish to RedGuides
+        uses: RedGuides/redguides-publish@v1
+        env:
+          REDGUIDES_API_KEY: ${{ secrets.REDGUIDES_API_KEY }}
+        with:
+          # >>> SET THIS once the RedGuides resource page exists. Until then the workflow will fail
+          # >>> at the publish step (deliberately - better than silently publishing to the wrong id).
+          # >>> Also record the resource/thread URL in the project notes the same day.
+          resource_id: "REPLACE_WITH_RG_RESOURCE_ID"
+          # README.md becomes the resource Overview on each release (edit the README, not the RG page).
+          description: "README.md"
+          version: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"
+          file: "${{ github.event.repository.name }}_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}.zip"
+          message: "rg_release_notes.md"
+          domain: "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/"
