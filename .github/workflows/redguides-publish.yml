@@ -53,8 +53,10 @@ jobs:
           REDGUIDES_API_KEY: ${{ secrets.REDGUIDES_API_KEY }}
         with:
           resource_id: "3339"
-          # README.md becomes the resource Overview on each release (edit the README, not the RG page).
-          description: "README.md"
+          # NO description/README sync - the RG Overview page is maintained by hand and has images
+          # added there that do not exist in the README, so a sync would wipe them on every release.
+          # The action only sends --description when this input is non-empty, so omitting it leaves
+          # the Overview untouched. Same setup as astone.
           version: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"
           file: "${{ github.event.repository.name }}_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}.zip"
           message: "rg_release_notes.md"
