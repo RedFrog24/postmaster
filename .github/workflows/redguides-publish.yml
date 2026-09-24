@@ -52,10 +52,7 @@ jobs:
         env:
           REDGUIDES_API_KEY: ${{ secrets.REDGUIDES_API_KEY }}
         with:
-          # >>> SET THIS once the RedGuides resource page exists. Until then the workflow will fail
-          # >>> at the publish step (deliberately - better than silently publishing to the wrong id).
-          # >>> Also record the resource/thread URL in the project notes the same day.
-          resource_id: "REPLACE_WITH_RG_RESOURCE_ID"
+          resource_id: "3339"
           # README.md becomes the resource Overview on each release (edit the README, not the RG page).
           description: "README.md"
           version: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"
