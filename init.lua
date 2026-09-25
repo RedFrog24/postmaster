@@ -14,7 +14,7 @@ local imgui = require('ImGui')
 local launchArgs = { ... }
 
 -- Preflight (computed once - these do not change mid-session)
-local version = "2.23"
+local version = "2.24"
 local myName = mq.TLO.Me.Name() or "unknown"
 local myRace = mq.TLO.Me.Race() or "Unknown"
 local myServer = mq.TLO.EverQuest.Server() or "unknown"
@@ -188,8 +188,6 @@ local state = {
     soundOn = true,      -- WAV chimes on milestones (played with /beep, Windows PlaySound)
     ttsOn = false,       -- speak milestones via MQTextToSpeech; off by default, it is intrusive
     ttsVoice = "",       -- last voice set from the picker, purely informational
-    pokBindConfirmed = false,   -- true once we've confirmed (or fixed) bind = PoK, so Gate/Philter/Vial
-                                 -- land somewhere useful. Checked once ever per character, not per-run.
 }
 
 -- Persistence
@@ -269,10 +267,20 @@ local zones = {
     guildLobby   = 344,
     neighborhood = 712,             -- shared by EVERY housing neighborhood - anchor on NPCs, not this
     pokShort     = "poknowledge",   -- PoK shortname (matches AL's pppoker)
-    -- Soulbinder Jera's zone. `Me.ZoneBound.ID() == 202` is how a PoK bind is confirmed - the value
-    -- is taken from pppoker's own field-verified config, not guessed.
+    -- `Me.ZoneBound.ID() == 202` is how a PoK bind is confirmed - the value is taken from pppoker's
+    -- own field-verified config, not guessed.
     pokId        = 202,
 }
+
+-- Is the character bound somewhere Gate is actually useful? Gate AA, the Gate spell, the Philter and the
+-- Vial all land at the BIND, so they only help when the bind is one of the two travel hubs. PoK has the
+-- books to every city; the Guild Lobby is where Sunrise Hills is reached from, one short hop from PoK.
+-- Read LIVE every time, never remembered: a player can rebind between runs, and a saved "yes" would
+-- quietly send Gate somewhere else.
+function zones.boundAtHub()
+    local id = mq.TLO.Me.ZoneBound.ID() or 0
+    return id == zones.pokId or id == zones.guildLobby
+end
 
 -- Death check shared by both wait helpers below (AL, 2026-08-11: died mid-travel twice in one session -
 -- once the script kept blindly continuing toward a stale destination after a manual respawn, once a wait
@@ -449,7 +457,8 @@ local tryGate         -- defined below with travelToZone; forward-declared so tr
                        -- how it ended up running the long way home from Vicus.
 local gateIsReady     -- the "can we Gate right now" test, in ONE place. It was written out inline
                        -- twice already and the two copies were the seed of this bug class.
-local ensurePokBind   -- defined near tryGate/travelToZone (needs navToNpc, zones.pokShort, waitWhileProgressing)
+local checkBind       -- defined near tryGate; reports a bind Gate cannot use. NEVER changes the bind
+local bindNoted = false   -- checkBind speaks once per run, not on every trip home
 local ensureMovementBuff   -- defined near navToNpc (needs printIfRunning, item/spell/AA data tables)
 local ensureShroud   -- defined near getGoblinRogueShroud (needs navToNpc, zones.pokShort, waitWhileProgressing)
 -- ensureHealed forward-declared earlier (right before waitUntil/waitWhileProgressing), not here - it
@@ -469,9 +478,8 @@ local function travelToSunriseHills()
     ensureMovementBuff()   -- before the Guild Lobby leg starts, not just the last-mile navToNpc walk -
                              -- confirmed both pppoker and Astone apply their movement buff before
                              -- /travelto too (2026-08-09), not only during the final NPC approach.
-    ensurePokBind()   -- checked/fixed once ever, before any real travel - every entry point funnels
-                       -- through here first, so this is the one natural hook postmaster has (pppoker
-                       -- checks this at its own single "Run start" instead, which postmaster lacks).
+    checkBind()   -- says so once if the bind is somewhere Gate cannot use. Reports only - the Gate tiers
+                   -- make their own live bind check at the moment they fire.
     ensureShroud()   -- evil race + under tuning.shroudLevel gets a Goblin Rogue Shroud from the start -
                       -- same single-early-hook shape as the two calls above.
     ensureHealed()   -- AL, 2026-08-11: arrived in PoK hurt after escaping Erudin, then died to the Halas
@@ -493,9 +501,10 @@ local function travelToSunriseHills()
         -- routing logic needs its own copy of any routing-priority fix" - applies across functions too,
         -- not just within one.
         --
-        -- Safe because ensurePokBind() ran a few lines above: bind is PoK, so Gate lands in PoK and the
-        -- remaining hop to the Guild Lobby is short. Best-effort - if Gate fails or is down, the
-        -- /travelto below still does the whole journey exactly as before.
+        -- gateIsReady() is only true while bound in PoK or the Guild Lobby, so Gate lands at one of
+        -- the two and the rest of the way here is short - from a Lobby bind, Gate lands right at the
+        -- destination. Best-effort - if Gate fails or is down, the /travelto below still does the
+        -- whole journey exactly as before.
         if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort and gateIsReady() then
             dbg('gating to the Plane of Knowledge first (much faster than running).')
             tryGate()
@@ -1606,47 +1615,28 @@ local function moveBoxToMainSlot()
     return not boxInBag()
 end
 
--- Binds at Soulbinder Jera in Plane of Knowledge - field-captured loc + exact phrase, adapted from
--- pppoker's proven ensurePokBind().
+-- THE SCRIPT NEVER CHANGES A PLAYER'S BIND. It used to walk anyone not bound in PoK to Soulbinder Jera and
+-- rebind them there - once, silently, and permanently. A player who keeps every character bound in the
+-- Guild Lobby (a perfectly good bind for this quest) asked whether the script could at least put the old
+-- bind back afterwards. It cannot in general - a bind can be almost anywhere - so the honest fix is to
+-- leave the bind alone.
 --
--- Gate AA/spell/Philter/Vial all port to BIND, not PoK directly (TRAVEL_REFERENCE.md Gate Pipeline) - if
--- bind isn't PoK, that "successful" gate could land somewhere unhelpful. Checked/fixed ONCE EVER per
--- character (state.pokBindConfirmed persists) - pppoker does this at its own single "Run start"; called
--- from travelToSunriseHills instead since postmaster has no equivalent single entry point, and every
--- flow already funnels through there before doing real quest work.
-ensurePokBind = function()
-    if state.pokBindConfirmed then return true end
-    if (mq.TLO.Me.ZoneBound.ID() or 0) == zones.pokId then
-        state.pokBindConfirmed = true
-        saveState()
-        return true
-    end
-    print('\ay[Postmaster]\ax not bound to Plane of Knowledge - Gate/Philter/Vial all port to bind, so'
-        .. ' fixing this once now saves trouble later. Traveling to Soulbinder Jera...')
-    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
-        mq.cmd('/travelto ' .. zones.pokShort)
-        if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") == zones.pokShort end, 20000, 300000) then
-            printIfRunning('\ar[Postmaster]\ax could not reach PoK to fix bind - travel there manually, then run again.')
-            return false
-        end
-        mq.delay(2000)
-    end
-    if not navToNpc("Soulbinder Jera") then
-        printIfRunning('\ar[Postmaster]\ax could not reach Soulbinder Jera - bind manually, then run again.')
-        return false
-    end
-    mq.cmdf('/target id %d', mq.TLO.Spawn("npc Soulbinder Jera").ID() or 0)
-    mq.delay(300)
-    mq.cmd('/say Bind')
-    mq.delay(5000)
-    if (mq.TLO.Me.ZoneBound.ID() or 0) == zones.pokId then
-        state.pokBindConfirmed = true
-        saveState()
-        print('\ag[Postmaster]\ax bound to Plane of Knowledge.')
-        return true
-    end
-    printIfRunning('\ar[Postmaster]\ax bind may not have completed - verify in-game.')
-    return false
+-- What changes instead is which Gate tiers fire. Gate AA, the Gate spell, the Philter and the Vial land at
+-- the bind, so tryGate() uses them only while zones.boundAtHub(). Drunkard's Stein (PoK), Zueria Slide (a
+-- wizard spire) and Throne of Heroes (the Guild Lobby) do not depend on bind, so they still fire. This
+-- only SPEAKS, once per run, and only when the bind actually costs this character a tier it owns - a
+-- melee with no Gate and no Philter or Vial loses nothing and hears nothing.
+checkBind = function()
+    if bindNoted or zones.boundAtHub() then return end
+    local ownsBindTier = (mq.TLO.Me.AltAbility("Gate").ID() or 0) > 0
+        or (mq.TLO.Me.Book("Gate")() or 0) > 0
+        or (mq.TLO.FindItem("=Philter of Major Translocation").ID() or 0) > 0
+        or (mq.TLO.FindItem("=Vial of Swirling Smoke").ID() or 0) > 0
+    if not ownsBindTier then return end
+    bindNoted = true
+    print('\ay[Postmaster]\ax you are bound in ' .. (mq.TLO.Me.ZoneBound.Name() or 'another zone')
+        .. ' - Gate, the Philter and the Vial all land at your bind, so they are skipped. Your bind is'
+        .. ' left alone; bind in the Plane of Knowledge or the Guild Lobby to use them.')
 end
 
 -- Spirit Shroud Selection window - Shroudkeeper Hyush, PoK (Y=257.00, X=152.00, Z=-129.06, field-
@@ -1725,8 +1715,8 @@ local function getGoblinRogueShroud()
     return true
 end
 
--- Gate condition for the whole Shroud Strategy (POSTMASTER_PIPELINE.md) - evil race AND below
--- tuning.shroudLevel, same "run once early" hook as ensureMovementBuff/ensurePokBind above.
+-- Gate condition for the whole Shroud Strategy - evil race AND below tuning.shroudLevel (reasoning
+-- at tuning.shroudLevel) - same "run once early" hook as ensureMovementBuff/checkBind above.
 ensureShroud = function()
     if not factionRisk then return true end
     if (mq.TLO.Me.Level() or 0) >= tuning.shroudLevel then return true end
@@ -1740,7 +1730,8 @@ end
 -- the first two checks; melee (no Gate AA/spell) naturally falls through to the item/Throne tiers, same
 -- real-world result as the two documented orders without hardcoding by class.
 -- Every method here lands the character AT PoK (Stein) or somewhere CLOSE to it (bind point via Gate AA/
--- spell/Philter/Vial, Guild Lobby via Throne, a wizard spire via Zueria Slide) - callers don't need to
+-- spell/Philter/Vial - those four ONLY while the bind is PoK or the Guild Lobby, see zones.boundAtHub() -
+-- Guild Lobby via Throne, a wizard spire via Zueria Slide) - callers don't need to
 -- know or care which fired, since the existing "/travelto zones.pokShort" step right after any tryGate() call
 -- finishes the hop from wherever it landed (AL, 2026-08-08: "Gate gets us to PoK, one way or another").
 -- Excludes 5/10-dose Gate potions (TRAVEL_REFERENCE.md: TLP-only, not on Live) and a Mirao purchase step
@@ -1763,25 +1754,44 @@ end
 -- written out inline at each decision point, and every new travel path that forgot to copy it silently
 -- lost Gate. Callers need it separately from tryGate() because it decides ROUTING (skip the long walk
 -- entirely), not merely whether an attempt would succeed.
+-- Only true while bound in PoK or the Guild Lobby: from any other bind, Gate would send the character
+-- somewhere unhelpful, and routing must not skip the walk on the strength of it.
+-- The third clause is the fix for casters who own Gate but keep their gems full of combat spells - the
+-- normal state. Before it, "Gate is in a gem" was the only spell test, nothing ever memorized it, and such
+-- a caster ran every long haul on foot.
 gateIsReady = function()
+    if not zones.boundAtHub() then return false end
     return ((mq.TLO.Me.AltAbility("Gate").ID() or 0) > 0 and mq.TLO.Me.AltAbilityReady("Gate")())
         or ((mq.TLO.Me.Gem("Gate")() or 0) > 0 and mq.TLO.Me.SpellReady("Gate")())
+        or ((mq.TLO.Me.Gem("Gate")() or 0) == 0 and (mq.TLO.Me.Book("Gate")() or 0) > 0)
 end
 
 tryGate = function()
     local startZone = mq.TLO.Zone.ID() or 0
+    local atHub = zones.boundAtHub()   -- gates the four tiers that land at the bind
     local gateAA = mq.TLO.Me.AltAbility("Gate")
-    if (gateAA.ID() or 0) > 0 and mq.TLO.Me.AltAbilityReady("Gate")() then
+    if atHub and (gateAA.ID() or 0) > 0 and mq.TLO.Me.AltAbilityReady("Gate")() then
         mq.cmdf('/alt activate %d', gateAA.ID())
         waitUntil(function() return (mq.TLO.Zone.ID() or 0) ~= startZone end, 10000, 200)
         return (mq.TLO.Zone.ID() or 0) ~= startZone
     end
-    if (mq.TLO.Me.Gem("Gate")() or 0) > 0 and mq.TLO.Me.SpellReady("Gate")() then
+    if atHub and (mq.TLO.Me.Gem("Gate")() or 0) > 0 and mq.TLO.Me.SpellReady("Gate")() then
         mq.cmd('/cast "Gate"')
         local castTime = (mq.TLO.Spell("Gate").CastTime() or 5000) + 3000
         waitUntil(function() return not mq.TLO.Me.Casting() end, castTime, 100)
         waitUntil(function() return (mq.TLO.Zone.ID() or 0) ~= startZone end, 5000, 200)
         return (mq.TLO.Zone.ID() or 0) ~= startZone
+    end
+    -- In the spellbook but not in a gem: memorize it, then cast. The Book check is the gate that matters -
+    -- Spell("Gate") alone only proves the spell exists in the GAME, which is true for a warrior too, and
+    -- memorizeAndCastSpell's own guard is that game-level check. Success is the zone changing, the one
+    -- confirmation a Gate cannot fake.
+    if atHub and (mq.TLO.Me.Gem("Gate")() or 0) == 0 and (mq.TLO.Me.Book("Gate")() or 0) > 0 then
+        if memorizeAndCastSpell("Gate", function()
+            return waitUntil(function() return (mq.TLO.Zone.ID() or 0) ~= startZone end, 10000, 200)
+        end) then
+            return true
+        end
     end
     local stein = mq.TLO.FindItem("=Drunkard's Stein")
     if (stein.ID() or 0) > 0 and (mq.TLO.Me.Level() or 0) >= 21 and (stein.TimerReady() or 0) == 0 then
@@ -1804,7 +1814,7 @@ tryGate = function()
         return true
     end
     local philter = mq.TLO.FindItem("=Philter of Major Translocation")
-    if (philter.ID() or 0) > 0 then
+    if atHub and (philter.ID() or 0) > 0 then
         mq.cmd('/nav pause')
         mq.cmdf('/useitem "%s"', philter.Name())
         mq.delay(11000)   -- 10s cast + margin
@@ -1812,7 +1822,7 @@ tryGate = function()
         return true
     end
     local vial = mq.TLO.FindItem("=Vial of Swirling Smoke")
-    if (vial.ID() or 0) > 0 then
+    if atHub and (vial.ID() or 0) > 0 then
         mq.cmdf('/useitem "%s"', vial.Name())
         mq.delay(1000)
         return true
@@ -1838,6 +1848,8 @@ local function travelToZone(traveltoArg, anchorNpc)
                       -- travelToSunriseHills. Same fix shape as ensureMovementBuff right above.
     ensureHealed()   -- same multi-hook-point reasoning - heal up here too if this leg happens to start
                       -- from a safe hub zone, not only when travelToSunriseHills was the entry point.
+    checkBind()   -- same reasoning again: a delivery batch never passes through travelToSunriseHills,
+                   -- so without this a caster bound elsewhere would run every leg with no word why.
 
     -- 0. leaving Kelethin from up on the platform? Ride the lift DOWN ourselves first so EasyFind's
     --    /travelto doesn't run us onto a moving platform and off the side (field: it clicked mid-run).
@@ -1965,8 +1977,12 @@ local function travelToZone(traveltoArg, anchorNpc)
     -- route). Whatever it lands on - PoK directly (Stein) or close to it (bind/Guild Lobby/a spire) -
     -- the /travelto zones.pokShort block right after finishes the hop if needed; its own guard condition
     -- just skips itself if gate already got us there, so no new fallback logic is needed here.
+    -- Wait to LEAVE this zone, not to reach PoK. Throne of Heroes lands in the Guild Lobby, the Slide at a
+    -- wizard spire, and a Lobby bind sends Gate to the Lobby - none of them ever becomes PoK, so the old
+    -- "== PoK" wait sat out its full 25 seconds after every one of them before the hop below moved on.
+    local gatedFrom = mq.TLO.Zone.ID() or 0
     if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort and tryGate() then
-        waitUntil(function() return (mq.TLO.Zone.ShortName() or "") == zones.pokShort end, 25000, 500)
+        waitUntil(function() return (mq.TLO.Zone.ID() or 0) ~= gatedFrom end, 25000, 500)
     end
     if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
         -- v1.50: don't re-fire /travelto if we're already mid-flee toward zones.pokShort - fleeIfInCombat()
