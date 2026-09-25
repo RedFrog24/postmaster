@@ -2,6 +2,7 @@
 # Tracked: init.lua + assets/ (FOUR runtime files) + README.md + the publish workflow. Nothing else.
 *.md
 !README.md
+docs/
 backup/
 design/
 tools/
