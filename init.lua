@@ -14,7 +14,7 @@ local imgui = require('ImGui')
 local launchArgs = { ... }
 
 -- Preflight (computed once - these do not change mid-session)
-local version = "2.20"
+local version = "2.23"
 local myName = mq.TLO.Me.Name() or "unknown"
 local myRace = mq.TLO.Me.Race() or "Unknown"
 local myServer = mq.TLO.EverQuest.Server() or "unknown"
@@ -37,17 +37,40 @@ local factionRisk = myRace == "Dark Elf" or myRace == "Troll" or myRace == "Ogre
 -- NOT the movement pipeline, which is for everyone regardless of level (efficiency, not safety).
 -- Different threshold from the separate, still-unbuilt "Level 15 or something" gnoll-danger disclaimer
 -- ToDo (TRAVEL_REFERENCE.md Zone-Transit Hazards) - two different dangers, don't conflate the numbers.
-local FACTION_RISK_LEVEL_GATE = 50
--- Starting guess (AL, 2026-08-08) - "there are likely other places, Felwithe gate, Kelethin Lift,
--- etc." not yet tested. Tune after field testing; single named constant so that's a one-line change.
-local GUARD_PROXIMITY_RADIUS = 200
+-- ONE table for every tuned threshold in the script, gathered here from four places up to 2800 lines
+-- apart. Two reasons, and the second is the one that matters day to day:
+--   1. The main chunk sits on Lua's hard 200-local ceiling - a UI rewrite once failed to compile
+--      outright with "too many local variables" - so five names folding into one buys back four slots.
+--   2. THREE of these are still first guesses that have never been checked against field data. Having
+--      them in one block means reading the current values, and changing them, is one place instead of
+--      a treasure hunt. Record what each was tuned against, right here, when it finally is.
+-- Same pattern as `items` / `aric` / `lysric` / `ui`. **Put new tuned numbers here, not loose.**
+local tuning = {}
+
+-- Below this level, a character is treated as at real risk from city guards. AL's own field data:
+-- guards cap around 40-50, so above it the danger is near zero in a 130-level game. Gates the
+-- invis/guard-avoidance system ONLY - NOT the movement pipeline, which is for everyone regardless of
+-- level (efficiency, not safety). Different threshold again from the separate, still-unbuilt
+-- "Level 15 or something" gnoll-danger disclaimer - two different dangers, don't conflate the numbers.
+tuning.factionRiskLevel = 50
+
+-- STARTING GUESS (AL, 2026-08-08), never yet tuned - "there are likely other places, Felwithe gate,
+-- Kelethin Lift, etc." not tested. How far out to look for a hostile NPC before taking cover.
+tuning.guardRadius = 200
 -- AL, 2026-08-11: "if race is evil AND less than level 60 we will go get a Goblin Rogue Shroud... this
 -- way we just do it from the start" - "due to City travel dangers." Deliberately a DIFFERENT (higher)
--- cutoff than FACTION_RISK_LEVEL_GATE above, not a typo - this supersedes the older reactive Invis
+-- cutoff than tuning.factionRiskLevel above, not a typo - this supersedes the older reactive Invis
 -- pipeline in practice for its whole target population (evil race, under this level) once live; that
 -- pipeline isn't removed, it just stops being what actually fires for most characters that would have
--- used it. See POSTMASTER_PIPELINE.md "Shroud Strategy" for the full design.
-local SHROUD_LEVEL_GATE = 60
+-- used it.
+tuning.shroudLevel = 60
+
+-- STARTING GUESS, no field data on the ideal range yet. How close `/stick ... behind` is told to sit
+-- when approaching a hostile NPC from behind.
+tuning.stickDistance = 12
+
+-- How long to keep waiting for health to come back before giving up and carrying on regardless.
+tuning.healWaitMs = 180000
 
 -- The 18 deliveries (pickup NPC/zone -> delivery NPC/zone). Data only; drives the checklist
 -- now and the automation in Phase 3.
@@ -234,14 +257,22 @@ end
 -- lobby->neighborhood sequence, with timeouts/bail on every wait. Run from the main loop
 -- ONLY (uses mq.delay - never call from the render thread).
 
-local GATE_SWITCH_ID    = 38
-local GUILD_LOBBY_ZONE  = 344
-local NEIGHBORHOOD_ZONE = 712
--- Lives up here with the other zone constants, NOT down with the travel helpers where it used to sit.
--- travelToSunriseHills (line ~420) is defined long before that point, so referencing it there resolved
--- to a nil GLOBAL - and `zone ~= nil` is always true, which silently disabled an "am I already in PoK?"
--- guard. Caught by luacheck as an undefined variable, which is precisely the class it exists to catch.
-local POK_SHORT         = "poknowledge"   -- PoK zone shortname (matches AL's pppoker)
+-- Every fixed zone and switch id the travel code keys on, in one table: five names, one local slot.
+--
+-- POSITION IS LOAD-BEARING - this table must stay declared up here, above travelToSunriseHills. The
+-- PoK shortname once lived down with the travel helpers, and because travelToSunriseHills is defined
+-- long before that point, its reference resolved to a nil GLOBAL - and `zone ~= nil` is always true,
+-- which silently disabled an "am I already in PoK?" guard. Caught by luacheck as an undefined variable,
+-- which is precisely the class it exists to catch.
+local zones = {
+    gateSwitch   = 38,              -- the Guild Lobby's neighborhood gate (a door/switch id)
+    guildLobby   = 344,
+    neighborhood = 712,             -- shared by EVERY housing neighborhood - anchor on NPCs, not this
+    pokShort     = "poknowledge",   -- PoK shortname (matches AL's pppoker)
+    -- Soulbinder Jera's zone. `Me.ZoneBound.ID() == 202` is how a PoK bind is confirmed - the value
+    -- is taken from pppoker's own field-verified config, not guessed.
+    pokId        = 202,
+}
 
 -- Death check shared by both wait helpers below (AL, 2026-08-11: died mid-travel twice in one session -
 -- once the script kept blindly continuing toward a stale destination after a manual respawn, once a wait
@@ -265,7 +296,7 @@ local ensureHealed   -- defined near inSafeHubZone (needs waitUntil) - forward-d
                       -- happens to pass BACK through PoK partway through (the Halas fallback-via-PoK case)
                       -- never got a second chance. "PoK should be an always hp check."
 
-local fleeIfInCombat   -- defined near considerNpc (needs POK_SHORT, justFledCombat) - forward-declared
+local fleeIfInCombat   -- defined near considerNpc (needs zones.pokShort, justFledCombat) - forward-declared
                         -- here so waitUntil/waitWhileProgressing below can check it on EVERY poll, not
                         -- just at the few explicit checkpoints inside approachAndInteract's retry loop.
                         -- AL, 2026-08-13: a shrouded character walking through Erudin (ordinary travel,
@@ -276,7 +307,7 @@ local fleeIfInCombat   -- defined near considerNpc (needs POK_SHORT, justFledCom
                         -- happening, bail now" safety net for the whole travel engine, not just the
                         -- narrow approach-and-interact window.
 local radiusWatch   -- defined near considerNpc/reactionIsSafe (needs considerSpawnId, reactionIsSafe,
-                     -- GUARD_PROXIMITY_RADIUS) - forward-declared here so waitUntil/waitWhileProgressing
+                     -- tuning.guardRadius) - forward-declared here so waitUntil/waitWhileProgressing
                      -- below can call it on EVERY poll, same shape as fleeIfInCombat/ensureHealed. AL,
                      -- 2026-08-14: Sneak's movement-speed penalty during ordinary travel was itself the
                      -- danger (field death on v1.46, Tox Forest guards) - "guards kill me because we are
@@ -286,6 +317,33 @@ local radiusWatch   -- defined near considerNpc/reactionIsSafe (needs considerSp
                      -- plain waitUntil (not waitWhileProgressing), and it's exactly the last-mile leg
                      -- where a guard is encountered - both primitives need this, same reasoning as
                      -- fleeIfInCombat above.
+
+-- Diagnostic output, off by default, toggled with `/postmaster debug`. Croakwatch's pattern
+-- (`cwDebug` + `/croakwatch debug`).
+--
+-- WHAT BELONGS HERE: internal measurements and step-by-step narration that only matter when something
+-- has gone wrong - distances, attempt counters, "trying X instead" routing chatter. These earned their
+-- keep while the script was being built (v2.06, v2.09 and v2.11 were all root-caused from console logs
+-- AL pasted back) but they are noise to somebody who just wants their bag.
+--
+-- WHAT DOES NOT: anything the user must act on, and one line per real milestone. Those stay visible.
+-- Also kept: anything that explains a VISIBLE PAUSE or a visible change in behaviour (meditating for
+-- mana, healing, dropping to a Sneak crawl). A silent stall reads as a hang and costs a support
+-- question, which is worse than the one line it would have taken to explain it.
+--
+-- THE RULE THAT DECIDES THE REST - do not narrate what a plugin already narrates. EasyFind and Nav
+-- announce their own progress, so a matching line from us is pure duplication. The exception is when
+-- the plugin's version is OPAQUE: "[Nav] Navigating to switch: OBJ_IRONGATESWITCH" means nothing to a
+-- player, so ours is the line worth keeping and theirs is the one worth squelching.
+--
+-- DELIBERATELY DEFINED HERE, above the two wait primitives, and that position is load-bearing: the
+-- stuck-detection message inside waitWhileProgressing needs it, and a local is only in scope AFTER its
+-- declaration. Declared below them, `dbg` there would silently resolve to a nil global - `luac -p`
+-- accepts that, and it would crash only when a route actually stalls, which can be an hour into a run.
+local pmDebug = false
+local function dbg(msg)
+    if pmDebug and running then print('\ao[Postmaster debug]\ax ' .. msg) end
+end
 
 local function waitUntil(cond, timeoutMs, stepMs)
     stepMs = stepMs or 200
@@ -345,7 +403,7 @@ local function waitWhileProgressing(cond, stuckAfterMs, ceilingMs, stepMs)
             lastX, lastY, lastZ = x, y, z
             lastProgressTime = mq.gettime()
         elseif mq.gettime() - lastProgressTime > stuckAfterMs then
-            print(string.format('\ay[Postmaster]\ax no progress for %ds - looks stuck, not just slow.', math.floor(stuckAfterMs / 1000)))
+            dbg(string.format('no progress for %ds - looks stuck, not just slow.', math.floor(stuckAfterMs / 1000)))
             return false
         end
         mq.delay(stepMs)
@@ -362,25 +420,6 @@ end
 -- (and whatever it unwinds into) still happens either way, this only silences the misleading console line.
 local function printIfRunning(msg)
     if running then print(msg) end
-end
-
--- Diagnostic output, off by default, toggled with `/postmaster debug`. Croakwatch's pattern
--- (`cwDebug` + `/croakwatch debug`).
---
--- WHAT BELONGS HERE: internal measurements and step-by-step narration that only matter when something
--- has gone wrong - distances, attempt counters, "trying X instead" routing chatter. These earned their
--- keep while the script was being built (v2.06, v2.09 and v2.11 were all root-caused from console logs
--- AL pasted back) but they are noise to somebody who just wants their bag.
---
--- WHAT DOES NOT: anything the user must act on, and one line per real milestone. Those stay visible.
---
--- THE RULE THAT DECIDES THE REST - do not narrate what a plugin already narrates. EasyFind and Nav
--- announce their own progress, so a matching line from us is pure duplication. The exception is when
--- the plugin's version is OPAQUE: "[Nav] Navigating to switch: OBJ_IRONGATESWITCH" means nothing to a
--- player, so ours is the line worth keeping and theirs is the one worth squelching.
-local pmDebug = false
-local function dbg(msg)
-    if pmDebug and running then print('\ao[Postmaster debug]\ax ' .. msg) end
 end
 
 -- A clickable EQ item link for console output - the purple links you can click to open the real item
@@ -410,14 +449,14 @@ local tryGate         -- defined below with travelToZone; forward-declared so tr
                        -- how it ended up running the long way home from Vicus.
 local gateIsReady     -- the "can we Gate right now" test, in ONE place. It was written out inline
                        -- twice already and the two copies were the seed of this bug class.
-local ensurePokBind   -- defined near tryGate/travelToZone (needs navToNpc, POK_SHORT, waitWhileProgressing)
+local ensurePokBind   -- defined near tryGate/travelToZone (needs navToNpc, zones.pokShort, waitWhileProgressing)
 local ensureMovementBuff   -- defined near navToNpc (needs printIfRunning, item/spell/AA data tables)
-local ensureShroud   -- defined near getGoblinRogueShroud (needs navToNpc, POK_SHORT, waitWhileProgressing)
+local ensureShroud   -- defined near getGoblinRogueShroud (needs navToNpc, zones.pokShort, waitWhileProgressing)
 -- ensureHealed forward-declared earlier (right before waitUntil/waitWhileProgressing), not here - it
 -- needs to be visible to waitWhileProgressing itself, not just this block's own callers.
 
 local function travelToSunriseHills()
-    if mq.TLO.Zone.ID() == NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() == zones.neighborhood then
         print(lysricNear() and '\ag[Postmaster]\ax already in Sunrise Hills.'
             or '\ay[Postmaster]\ax in a neighborhood, but Lysric not found - check VoA / instance.')
         return
@@ -433,7 +472,7 @@ local function travelToSunriseHills()
     ensurePokBind()   -- checked/fixed once ever, before any real travel - every entry point funnels
                        -- through here first, so this is the one natural hook postmaster has (pppoker
                        -- checks this at its own single "Run start" instead, which postmaster lacks).
-    ensureShroud()   -- evil race + under SHROUD_LEVEL_GATE gets a Goblin Rogue Shroud from the start -
+    ensureShroud()   -- evil race + under tuning.shroudLevel gets a Goblin Rogue Shroud from the start -
                       -- same single-early-hook shape as the two calls above.
     ensureHealed()   -- AL, 2026-08-11: arrived in PoK hurt after escaping Erudin, then died to the Halas
                       -- zone-in guards partly for having gone in already hurt - free, risk-free recovery
@@ -442,7 +481,7 @@ local function travelToSunriseHills()
     traveling = true
 
     -- 1. Guild Lobby
-    if mq.TLO.Zone.ID() ~= GUILD_LOBBY_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.guildLobby then
         -- GATE FIRST on a long haul. This entry point used to go straight to /travelto, so a
         -- Gate-capable character RAN the entire way home - AL, 2026-08-24, returning from Vicus in
         -- North Qeynos: "we do have a Gate call, we run".
@@ -457,8 +496,8 @@ local function travelToSunriseHills()
         -- Safe because ensurePokBind() ran a few lines above: bind is PoK, so Gate lands in PoK and the
         -- remaining hop to the Guild Lobby is short. Best-effort - if Gate fails or is down, the
         -- /travelto below still does the whole journey exactly as before.
-        if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT and gateIsReady() then
-            print('\ay[Postmaster]\ax gating to the Plane of Knowledge first (much faster than running).')
+        if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort and gateIsReady() then
+            dbg('gating to the Plane of Knowledge first (much faster than running).')
             tryGate()
         end
         -- No "traveling to Guild Lobby..." line here: EasyFind announces the same thing on the very
@@ -469,7 +508,7 @@ local function travelToSunriseHills()
         -- 180s (not 60s): field-proven a multi-hop route (e.g. South Qeynos -> N.Qeynos -> PoK ->
         -- Guild Lobby) can take just over 60s to actually finish - same class of bug already fixed for
         -- the Kelethin CALL-nav and West Karana's navToNpc (EasyFind was still working, we just quit too early).
-        if not waitUntil(function() return mq.TLO.Zone.ID() == GUILD_LOBBY_ZONE end, 180000, 1000) then
+        if not waitUntil(function() return mq.TLO.Zone.ID() == zones.guildLobby end, 180000, 1000) then
             printIfRunning('\ar[Postmaster]\ax never reached the Guild Lobby (is /travelto available?).')
             traveling = false
             return
@@ -481,19 +520,26 @@ local function travelToSunriseHills()
     end
 
     -- 2. Open the neighborhood gate
+    --
+    -- This line stays VISIBLE while Nav's own is silenced, and that is the deliberate way round. Nav
+    -- announces this leg as "Navigating to switch: OBJ_IRONGATESWITCH", which tells a player nothing -
+    -- so ours is the line worth keeping and the plugin's is the one worth suppressing.
     print('\ay[Postmaster]\ax in the Guild Lobby - navigating to the neighborhood gate...')
-    mq.cmd('/nav log=off')
+    -- (A bare `/nav log=off` used to sit here, inherited from guildhall.lua. It never did anything:
+    -- MQ2Nav's own help calls log= an option that adjusts "log level for command", so it needs a
+    -- navigation command to attach to. With no destination it is a no-op, which is why the [Nav]
+    -- chatter kept appearing. The real control is log=off appended to each /nav below.)
     -- Navigation.Active() sometimes reads false before the walk even engages (same flake we hit on
     -- the Kelethin CALL-nav), so "wait for finish" can trivially pass with zero actual movement. Retry
     -- the whole nav+distance check a few times before giving up - cheaper and more honest than a
     -- one-shot bail, and the distance print gives real numbers if it still fails.
     local gateDist = nil
     for attempt = 1, 3 do
-        mq.cmdf('/nav door id %d', GATE_SWITCH_ID)
+        mq.cmdf('/nav door id %d log=off', zones.gateSwitch)
         waitUntil(function() return mq.TLO.Navigation.Active() end, 5000, 100)       -- wait for nav to START
         waitUntil(function() return not mq.TLO.Navigation.Active() end, 30000, 200)  -- then wait for it to FINISH
         mq.delay(500)
-        mq.cmdf('/squelch /doortarget id %d', GATE_SWITCH_ID)
+        mq.cmdf('/squelch /doortarget id %d', zones.gateSwitch)
         mq.delay(300)
         gateDist = mq.TLO.Switch.Distance()
         dbg(string.format('gate attempt %d: distance=%s', attempt, tostring(gateDist)))
@@ -526,7 +572,7 @@ local function travelToSunriseHills()
     mq.cmd('/notify RealEstateNeighborhoodWnd RENW_Go_Button leftmouseup')
 
     -- 4. Confirm arrival
-    if not waitUntil(function() return mq.TLO.Zone.ID() == NEIGHBORHOOD_ZONE end, 45000, 1000) then
+    if not waitUntil(function() return mq.TLO.Zone.ID() == zones.neighborhood end, 45000, 1000) then
         printIfRunning('\ar[Postmaster]\ax did not zone into the neighborhood.')
         traveling = false
         return
@@ -548,8 +594,17 @@ local function travelToSunriseHills()
 end
 
 -- Nonad Brothers (Phase 2). PLACEHOLDERS - verify against the game (Allakhazam starting values).
-local PAGUS_NAME     = "Pagus Nonad"
-local VICUS_NAME     = "Vicus Nonad"
+-- The Nonad Brothers questline's NPCs, say-phrases and travel arg: seven names, one local slot.
+-- Say-phrases must be EXACT - an NPC answers only its own keywords.
+local nonad = {
+    pagus          = "Pagus Nonad",
+    vicus          = "Vicus Nonad",
+    reward         = "Miniature Action Lashun",   -- Pagus's reward figure = Nonad completion flag (confirmed)
+    brotherPhrase  = "Tell me about your brother",
+    helpPhrase     = "help you with collections",
+    listPhrase     = "What list?",   -- Vicus forgets the List of Debtors unless you ask (keyword [list])
+    qeynosTravelto = "qeynos",       -- PLACEHOLDER: /travelto arg that lands in South Qeynos - verify
+}
 -- ONE table for every quest item name. These were six separate locals and the main chunk sits right on
 -- Lua's 200-local ceiling (REFACTOR_NOTES.md #1) - folding them frees five slots and gives anything new
 -- an obvious home. Same pattern as `aric` / `lysric` / `ui`. **Put new item names here.**
@@ -560,11 +615,6 @@ local items = {
     satchel = "Featherweight Satchel of the Courier",
 }
 items.list = "List of Debtors"
-local NONAD_REWARD   = "Miniature Action Lashun"   -- Pagus's reward figure = Nonad completion flag (confirmed)
-local BROTHER_PHRASE = "Tell me about your brother"
-local HELP_PHRASE    = "help you with collections"
-local LIST_PHRASE    = "What list?"   -- Vicus forgets the List of Debtors unless you ask (keyword [list])
-local QEYNOS_TRAVELTO = "qeynos"        -- PLACEHOLDER: /travelto arg that lands in South Qeynos - verify
 -- Zones reached via an intermediate hop. Revamped Freeport shortnames are "freeportwest" /
 -- "freeporteast" (per pppoker, zone IDs 383/382); route East Freeport via West Freeport to be safe.
 local zoneRule = {}
@@ -648,11 +698,14 @@ zoneRule.adjacent = {
     ["qeynos2"]  = { "qeynos" },    -- the zone line" - a Gate-ready character was skipping straight to
                                      -- Gate+PoK for this hop since it wasn't in this table yet)
 }
-local TAX_PHRASE      = "tax collection"
+-- The Taxes #528 sub-quest: its say-phrase, debtors, their zones and the Flynn workaround - seven
+-- names, one local slot. Same declare-then-fill pattern as `kelethin` / `halas`.
+local tax = {}
+tax.phrase = "tax collection"
 items.fullbox = "Full Tax Collection Box"
 -- The 10 tax debtors. PLACEHOLDER names - verify in-field (navToNpc finds them by live spawn).
--- First 8 are in South Qeynos; the last 2 live in other Qeynos zones (see MERCHANT_ZONE).
-local TAX_MERCHANTS = {
+-- First 8 are in South Qeynos; the last 2 live in other Qeynos zones (see tax.merchantZone).
+tax.merchants = {
     "Ton Firepride", "Mar Sedder", "Nesiff Tallaherd", "Fhara Semhart",
     "Tasya Huntlan", "Captain Rohand", "Fish Ranamer", "Voleen Tassen",
     "Sneed Galliway", "Mira Sayer",
@@ -660,17 +713,17 @@ local TAX_MERCHANTS = {
 
 -- Merchants NOT in South Qeynos -> the /travelto arg for their home zone (both field-verified).
 -- Merchants absent from this map are assumed to be in South Qeynos.
-local MERCHANT_ZONE = {
+tax.merchantZone = {
     ["Sneed Galliway"] = "qeynos2",    -- North Qeynos (verified)
     -- Mira Sayer (Qeynos Hills, qeytoqrg) is SKIPPED - her tax is collected straight from Flynn.
 }
 
 -- Mira's tax may be "robbed" - then it's collected from Flynn Merrington (North Qeynos) with an
 -- exact phrase. PLACEHOLDERs - verify name / zone / phrase in-field.
-local MIRA_NAME    = "Mira Sayer"
-local FLYNN_NAME   = "Flynn Merrington"
-local FLYNN_ZONE   = "qeynos2"
-local FLYNN_PHRASE = "I am a gnoll loving weakling who isn't fit to comb my feet"
+tax.mira        = "Mira Sayer"
+tax.flynn       = "Flynn Merrington"
+tax.flynnZone   = "qeynos2"
+tax.flynnPhrase = "I am a gnoll loving weakling who isn't fit to comb my feet"
 
 -- Engine helpers (reused by every quest step in Phase 2 and 3). Main-loop only (use mq.delay).
 
@@ -730,7 +783,7 @@ local function rideKelethinLift()
     -- 1. nav (mesh) to the ground calling spot
     dbg(string.format('rideKelethinLift: navving to CALL (%.2f,%.2f,%.2f)',
         kelethin.call.y, kelethin.call.x, kelethin.call.z))
-    mq.cmdf('/squelch /nav loc %.2f %.2f %.2f', kelethin.call.y, kelethin.call.x, kelethin.call.z)
+    mq.cmdf('/nav loc %.2f %.2f %.2f log=off', kelethin.call.y, kelethin.call.x, kelethin.call.z)
     mq.delay(500)
     -- 180s (not 60s): field-proven nav to CALL always succeeds but sometimes takes longer than 60s
     -- (path length varies with which zone connection we entered gfaydark through).
@@ -743,12 +796,12 @@ local function rideKelethinLift()
 
     -- 2. call the platform down (it rests up) and wait ~8s for it to arrive
     dbg('calling lift down via switch ' .. kelethin.btn)
-    print('\ay[Postmaster]\ax calling the Kelethin lift down...')
+    dbg('calling the Kelethin lift down...')
     clickDoorSwitch(kelethin.btn)
     mq.delay(9000)   -- ~8s travel + margin (AL-measured)
 
     -- 3. /moveto ONTO the platform (no navmesh on it), then confirm we actually landed on it (z ~ ground)
-    print('\ay[Postmaster]\ax stepping onto the lift platform...')
+    dbg('stepping onto the lift platform...')
     mq.cmdf('/squelch /moveto loc %.2f %.2f %.2f', kelethin.board.y, kelethin.board.x, kelethin.board.z)
     mq.delay(500)
     waitUntil(function() return not mq.TLO.Me.Moving() end, 8000, 100)
@@ -761,7 +814,7 @@ local function rideKelethinLift()
 
     -- 4. click 73 again to rise; wait until Me.Z reaches the top landing height
     dbg('rising via switch ' .. kelethin.btn)
-    print('\ay[Postmaster]\ax riding the lift up...')
+    dbg('riding the lift up...')
     clickDoorSwitch(kelethin.btn)
     if not waitUntil(function() return (mq.TLO.Me.Z() or 0) >= kelethin.topZ - 4 end, 15000, 200) then
         print('\ay[Postmaster]\ax lift did not reach the top - assist fallback.')
@@ -770,7 +823,7 @@ local function rideKelethinLift()
     mq.delay(800)
 
     -- 5. /moveto OFF the platform onto the top landing (no mesh here either), then navToNpc takes over
-    print('\ay[Postmaster]\ax stepping off onto the top landing...')
+    dbg('stepping off onto the top landing...')
     mq.cmdf('/squelch /moveto loc %.2f %.2f %.2f', kelethin.alight.y, kelethin.alight.x, kelethin.alight.z)
     mq.delay(500)
     waitUntil(function() return not mq.TLO.Me.Moving() end, 8000, 100)
@@ -787,7 +840,7 @@ end
 local function descendKelethinLift()
     if (mq.TLO.Me.Z() or 0) < kelethin.topZ - 20 then return false end   -- not up top; nothing to do
 
-    print('\ay[Postmaster]\ax stepping onto the top platform to descend...')
+    dbg('stepping onto the top platform to descend...')
 
     -- NAV to the landing FIRST, then /moveto onto the platform. This mirrors the UP path exactly
     -- (/nav to CALL, then /moveto onto BOARD) and it was MISSING here - the descent went straight to
@@ -802,7 +855,7 @@ local function descendKelethinLift()
     -- This is very likely why the descent has always been the unreliable half while the ascent has
     -- multiple clean runs. **Needs field confirmation** - the mechanism fits the evidence exactly, but
     -- it has not yet been watched working.
-    mq.cmdf('/squelch /nav loc %.2f %.2f %.2f', kelethin.alight.y, kelethin.alight.x, kelethin.alight.z)
+    mq.cmdf('/nav loc %.2f %.2f %.2f log=off', kelethin.alight.y, kelethin.alight.x, kelethin.alight.z)
     waitUntil(function() return mq.TLO.Navigation.Active() end, 5000, 100)
     waitUntil(function() return not mq.TLO.Navigation.Active() end, 30000, 200)
     mq.delay(400)
@@ -817,15 +870,15 @@ local function descendKelethinLift()
         -- is exactly what diagnosed this, and exactly what a player cannot read.
         dbg(string.format('board-top miss: off by %.1f - meY=%.1f meX=%.1f meZ=%.1f',
             math.sqrt(dy * dy + dx * dx), mq.TLO.Me.Y() or 0, mq.TLO.Me.X() or 0, mq.TLO.Me.Z() or 0))
-        print('\ay[Postmaster]\ax could not board the lift platform - letting EasyFind route down instead.')
+        dbg('could not board the lift platform - letting EasyFind route down instead.')
         return false
     end
 
     dbg('descending via switch ' .. kelethin.topBtn)
-    print('\ay[Postmaster]\ax riding the lift down...')
+    dbg('riding the lift down...')
     clickDoorSwitch(kelethin.topBtn)
     if not waitUntil(function() return (mq.TLO.Me.Z() or 0) <= kelethin.board.z + 4 end, 15000, 200) then
-        print('\ay[Postmaster]\ax descent did not complete - letting EasyFind route down.')
+        dbg('descent did not complete - letting EasyFind route down.')
         return false
     end
     mq.delay(800)
@@ -927,7 +980,7 @@ end
 -- line until the shuttle docks... wrong"). Now navs to the confirmed waiting spot BEFORE waiting.
 local function rideHalasShuttleIn()
     if (mq.TLO.Spawn(halas.shuttleName).ID() or 0) == 0 then
-        print('\ay[Postmaster]\ax Halas shuttle not found - swimming across instead.')
+        dbg('Halas shuttle not found - swimming across instead.')
         return false
     end
     print('\ao[Postmaster]\ax heading to the shuttle dock...')
@@ -942,7 +995,7 @@ local function rideHalasShuttleIn()
         local s = mq.TLO.Spawn(halas.shuttleName)
         return not s.Moving() and (s.Y() or 0) < -300
     end, 180000, 1000) then
-        print('\ay[Postmaster]\ax shuttle did not dock on our side in time - swimming across instead.')
+        dbg('shuttle did not dock on our side in time - swimming across instead.')
         return false
     end
     local boatY = mq.TLO.Spawn(halas.shuttleName).Y() or halas.shuttleDockZonein.y
@@ -958,7 +1011,7 @@ local function rideHalasShuttleIn()
     -- the crossing itself is short and well-understood (~5s at its confirmed Speed 71.42) - if it
     -- doesn't dock on the far side reasonably quickly from THIS point, something's actually wrong.
     if not waitUntil(function() return mq.TLO.Spawn(halas.shuttleName).Moving() end, 180000, 1000) then
-        print('\ay[Postmaster]\ax shuttle never departed - continuing manually.')
+        dbg('shuttle never departed - continuing manually.')
         return false
     end
     print('\ao[Postmaster]\ax riding across...')
@@ -966,7 +1019,7 @@ local function rideHalasShuttleIn()
         local s = mq.TLO.Spawn(halas.shuttleName)
         return not s.Moving() and (s.Y() or -999) > -200
     end, 30000, 500) then
-        print('\ay[Postmaster]\ax shuttle crossing took too long - continuing manually.')
+        dbg('shuttle crossing took too long - continuing manually.')
         return false
     end
     mq.cmdf('/squelch /moveto loc %.2f %.2f %.2f', halas.shuttleLandingCity.y, halas.shuttleLandingCity.x, halas.shuttleLandingCity.z)
@@ -982,7 +1035,7 @@ end
 -- travelToZone's PoK-hub wait, unchanged).
 local function rideHalasShuttleOut()
     if (mq.TLO.Spawn(halas.shuttleName).ID() or 0) == 0 then
-        print('\ay[Postmaster]\ax Halas shuttle not found - swimming out instead.')
+        dbg('Halas shuttle not found - swimming out instead.')
         return false
     end
     print('\ao[Postmaster]\ax heading to the shuttle dock (city side)...')
@@ -996,7 +1049,7 @@ local function rideHalasShuttleOut()
         local s = mq.TLO.Spawn(halas.shuttleName)
         return not s.Moving() and (s.Y() or -999) > -200
     end, 180000, 1000) then
-        print('\ay[Postmaster]\ax shuttle did not dock on our side in time - swimming out instead.')
+        dbg('shuttle did not dock on our side in time - swimming out instead.')
         return false
     end
     local boatY = mq.TLO.Spawn(halas.shuttleName).Y() or halas.shuttleDockCity.y
@@ -1008,7 +1061,7 @@ local function rideHalasShuttleOut()
     -- Two phases, not one blind timeout - see rideHalasShuttleIn for the field bug this fixes (a
     -- single 60s wait covering both the dock-pause and the crossing fired mid-crossing).
     if not waitUntil(function() return mq.TLO.Spawn(halas.shuttleName).Moving() end, 180000, 1000) then
-        print('\ay[Postmaster]\ax shuttle never departed - continuing manually.')
+        dbg('shuttle never departed - continuing manually.')
         return false
     end
     print('\ao[Postmaster]\ax riding back...')
@@ -1016,7 +1069,7 @@ local function rideHalasShuttleOut()
         local s = mq.TLO.Spawn(halas.shuttleName)
         return not s.Moving() and (s.Y() or 0) < -300
     end, 30000, 500) then
-        print('\ay[Postmaster]\ax shuttle crossing took too long - continuing manually.')
+        dbg('shuttle crossing took too long - continuing manually.')
         return false
     end
     mq.cmdf('/squelch /moveto loc %.2f %.2f %.2f', halas.shuttleWaitZonein.y, halas.shuttleWaitZonein.x, halas.shuttleWaitZonein.z)
@@ -1104,7 +1157,7 @@ local function memorizeAndCastSpell(spell, verifyFn)
             mq.cmdf('/memspell %d clear', gemSlot)
             mq.delay(2000)
         end
-        print(string.format('\ay[Postmaster]\ax memorizing %s in gem %d...', spell, gemSlot))
+        dbg(string.format('memorizing %s in gem %d...', spell, gemSlot))
         mq.cmdf('/memspell %d "%s"', gemSlot, spell)
         mq.delay(8000)
     end
@@ -1251,7 +1304,7 @@ end
 -- "Kaladim Guard") both contain "guard" regardless of prefix/suffix position, so a substring match
 -- catches either naming convention.
 local function guardNearby()
-    return (mq.TLO.Spawn(string.format("npc name guard radius %d", GUARD_PROXIMITY_RADIUS)).ID() or 0) > 0
+    return (mq.TLO.Spawn(string.format("npc name guard radius %d", tuning.guardRadius)).ID() or 0) > 0
 end
 
 local function navToNpc(name)
@@ -1263,7 +1316,7 @@ local function navToNpc(name)
     local watchErudinGem = (mq.TLO.Zone.ShortName() or "") == "erudnext"
     -- Movement: unconditional, for everyone (see ensureMovementBuff's own comment). Invis/guard-watch:
     -- only for factionRisk characters below the level where guard aggro stops mattering.
-    local watchGuards = factionRisk and (mq.TLO.Me.Level() or 0) < FACTION_RISK_LEVEL_GATE
+    local watchGuards = factionRisk and (mq.TLO.Me.Level() or 0) < tuning.factionRiskLevel
     ensureMovementBuff()
     mq.cmdf('/nav id %d log=off', id)
     mq.delay(500)   -- let pathing engage before we watch Navigation.Active
@@ -1378,7 +1431,7 @@ local function openGiveWindow()
         opened = true
     else
         local pausedIt = pauseCwtnIfLoaded()
-        print('\ay[Postmaster]\ax give window did not open - retrying' .. (pausedIt and ' with CWTN paused' or '') .. '...')
+        dbg('give window did not open - retrying' .. (pausedIt and ' with CWTN paused' or '') .. '...')
         mq.cmd('/click left target')
         opened = waitUntil(function()
             return mq.TLO.Window("GiveWnd").Open() or mq.TLO.Window("TradeWnd").Open()
@@ -1553,11 +1606,9 @@ local function moveBoxToMainSlot()
     return not boxInBag()
 end
 
--- Soulbinder Jera in Plane of Knowledge - field-captured loc + exact phrase, adapted from pppoker's
--- proven ensurePokBind() (mq.TLO.Me.ZoneBound.ID() == 202 confirms PoK bind; POK_ZONE_ID = 202 verified
--- in pppoker's own config, not guessed).
-local POK_ZONE_ID = 202
-
+-- Binds at Soulbinder Jera in Plane of Knowledge - field-captured loc + exact phrase, adapted from
+-- pppoker's proven ensurePokBind().
+--
 -- Gate AA/spell/Philter/Vial all port to BIND, not PoK directly (TRAVEL_REFERENCE.md Gate Pipeline) - if
 -- bind isn't PoK, that "successful" gate could land somewhere unhelpful. Checked/fixed ONCE EVER per
 -- character (state.pokBindConfirmed persists) - pppoker does this at its own single "Run start"; called
@@ -1565,16 +1616,16 @@ local POK_ZONE_ID = 202
 -- flow already funnels through there before doing real quest work.
 ensurePokBind = function()
     if state.pokBindConfirmed then return true end
-    if (mq.TLO.Me.ZoneBound.ID() or 0) == POK_ZONE_ID then
+    if (mq.TLO.Me.ZoneBound.ID() or 0) == zones.pokId then
         state.pokBindConfirmed = true
         saveState()
         return true
     end
     print('\ay[Postmaster]\ax not bound to Plane of Knowledge - Gate/Philter/Vial all port to bind, so'
         .. ' fixing this once now saves trouble later. Traveling to Soulbinder Jera...')
-    if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT then
-        mq.cmd('/travelto ' .. POK_SHORT)
-        if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") == POK_SHORT end, 20000, 300000) then
+    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
+        mq.cmd('/travelto ' .. zones.pokShort)
+        if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") == zones.pokShort end, 20000, 300000) then
             printIfRunning('\ar[Postmaster]\ax could not reach PoK to fix bind - travel there manually, then run again.')
             return false
         end
@@ -1588,7 +1639,7 @@ ensurePokBind = function()
     mq.delay(300)
     mq.cmd('/say Bind')
     mq.delay(5000)
-    if (mq.TLO.Me.ZoneBound.ID() or 0) == POK_ZONE_ID then
+    if (mq.TLO.Me.ZoneBound.ID() or 0) == zones.pokId then
         state.pokBindConfirmed = true
         saveState()
         print('\ag[Postmaster]\ax bound to Plane of Knowledge.')
@@ -1613,9 +1664,9 @@ end
 -- by exact value (floor to the nearest 5, capped at 70) instead of trusting a default.
 local function getGoblinRogueShroud()
     if mq.TLO.Me.Shrouded() then return true end
-    if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT then
-        mq.cmd('/travelto ' .. POK_SHORT)
-        if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") == POK_SHORT end, 20000, 300000) then
+    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
+        mq.cmd('/travelto ' .. zones.pokShort)
+        if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") == zones.pokShort end, 20000, 300000) then
             printIfRunning('\ar[Postmaster]\ax could not reach PoK to get a shroud - travel there manually, then run again.')
             return false
         end
@@ -1675,10 +1726,10 @@ local function getGoblinRogueShroud()
 end
 
 -- Gate condition for the whole Shroud Strategy (POSTMASTER_PIPELINE.md) - evil race AND below
--- SHROUD_LEVEL_GATE, same "run once early" hook as ensureMovementBuff/ensurePokBind above.
+-- tuning.shroudLevel, same "run once early" hook as ensureMovementBuff/ensurePokBind above.
 ensureShroud = function()
     if not factionRisk then return true end
-    if (mq.TLO.Me.Level() or 0) >= SHROUD_LEVEL_GATE then return true end
+    if (mq.TLO.Me.Level() or 0) >= tuning.shroudLevel then return true end
     if mq.TLO.Me.Shrouded() then return true end
     return getGoblinRogueShroud()
 end
@@ -1690,7 +1741,7 @@ end
 -- real-world result as the two documented orders without hardcoding by class.
 -- Every method here lands the character AT PoK (Stein) or somewhere CLOSE to it (bind point via Gate AA/
 -- spell/Philter/Vial, Guild Lobby via Throne, a wizard spire via Zueria Slide) - callers don't need to
--- know or care which fired, since the existing "/travelto POK_SHORT" step right after any tryGate() call
+-- know or care which fired, since the existing "/travelto zones.pokShort" step right after any tryGate() call
 -- finishes the hop from wherever it landed (AL, 2026-08-08: "Gate gets us to PoK, one way or another").
 -- Excludes 5/10-dose Gate potions (TRAVEL_REFERENCE.md: TLP-only, not on Live) and a Mirao purchase step
 -- (buying happens during an unrelated PoK visit, not reactively while stuck somewhere that isn't PoK).
@@ -1819,13 +1870,13 @@ local function travelToZone(traveltoArg, anchorNpc)
     -- 12s) - tryGate() can now internally take up to ~21s on its own (Zueria Slide's 20s cast) before
     -- even returning, so the old 12s window would time out on a successful gate that just needed a
     -- little more time to actually land.
-    if mq.TLO.Zone.ID() == NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() == zones.neighborhood then
         if tryGate() then
-            waitUntil(function() return mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE end, 25000, 500)
+            waitUntil(function() return mq.TLO.Zone.ID() ~= zones.neighborhood end, 25000, 500)
         end
-        if mq.TLO.Zone.ID() == NEIGHBORHOOD_ZONE then
-            mq.cmd('/travelto ' .. POK_SHORT)
-            if not waitUntil(function() return mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE end, 180000, 2000) then
+        if mq.TLO.Zone.ID() == zones.neighborhood then
+            mq.cmd('/travelto ' .. zones.pokShort)
+            if not waitUntil(function() return mq.TLO.Zone.ID() ~= zones.neighborhood end, 180000, 2000) then
                 printIfRunning('\ar[Postmaster]\ax could not leave the neighborhood - travel out manually, then run again.')
                 return false
             end
@@ -1837,7 +1888,7 @@ local function travelToZone(traveltoArg, anchorNpc)
     -- Tried before falling through to the normal PoK route below; either hop stalling just falls
     -- through to that same proven fallback.
     local viaDirect = zoneRule.viaDirect[traveltoArg]
-    if viaDirect and (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT then
+    if viaDirect and (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
         mq.cmd('/travelto ' .. viaDirect)
         local reachedVia = waitWhileProgressing(function()
             if watchHalasExit then halasExitWatch() end
@@ -1865,7 +1916,7 @@ local function travelToZone(traveltoArg, anchorNpc)
         end
         mq.cmd('/easyfind stop')
         mq.cmd('/travelto stop')
-        print('\ay[Postmaster]\ax via ' .. viaDirect .. ' to ' .. traveltoArg .. ' didn\'t pan out - falling back to Plane of Knowledge.')
+        dbg('via ' .. viaDirect .. ' to ' .. traveltoArg .. ' didn\'t pan out - falling back to Plane of Knowledge.')
     end
 
     -- 2. try a DIRECT /travelto first, using progress-based detection instead of a fixed timeout - if
@@ -1882,14 +1933,14 @@ local function travelToZone(traveltoArg, anchorNpc)
     -- not in zoneRule.preferPok, so direct was tried and "succeeded," just via a slow multi-hop EasyFind
     -- route that never gave Gate a chance to fire - Gate only lived in step 3, the "direct stalled"
     -- fallback). Fix: a Gate-capable character skips straight to step 3 (which already tries Gate before
-    -- /travelto POK_SHORT) UNLESS the destination is a confirmed-short adjacent hop (zoneRule.adjacent,
+    -- /travelto zones.pokShort) UNLESS the destination is a confirmed-short adjacent hop (zoneRule.adjacent,
     -- already used for pickup reprioritization - a real confirmed-direct list, not a guess) - keeps the
     -- Halas/Everfrost-style short-hop optimization intact while skipping the slow walk for long hauls.
     local isKnownAdjacent = false
     for _, adj in ipairs(zoneRule.adjacent[mq.TLO.Zone.ShortName() or ""] or {}) do
         if adj == traveltoArg then isKnownAdjacent = true; break end
     end
-    if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT and not zoneRule.preferPok[traveltoArg]
+    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort and not zoneRule.preferPok[traveltoArg]
         and (isKnownAdjacent or not gateIsReady()) then
         mq.cmd('/travelto ' .. traveltoArg)
         local arrived = waitWhileProgressing(function()
@@ -1898,7 +1949,7 @@ local function travelToZone(traveltoArg, anchorNpc)
         end, 20000, 300000)
         if arrived then return true end
         -- v1.50: don't stop travel if the wait aborted because fleeIfInCombat() just fired - that call
-        -- already issued its OWN /travelto POK_SHORT a moment earlier, and stopping "travel" here
+        -- already issued its OWN /travelto zones.pokShort a moment earlier, and stopping "travel" here
         -- actually cancels THAT in-flight flee, not the original (already-abandoned) direct attempt.
         -- Field-confirmed (AL, 2026-08-14): the log showed "[EasyFind] Traveling to: The Plane of
         -- Knowledge" immediately followed by "[EasyFind] /travelto stopped" - this exact line canceling
@@ -1906,29 +1957,29 @@ local function travelToZone(traveltoArg, anchorNpc)
         if not justFledCombat then
             mq.cmd('/travelto stop')
         end
-        print('\ay[Postmaster]\ax direct travel to ' .. traveltoArg .. ' stalled - routing via Plane of Knowledge instead.')
+        dbg('direct travel to ' .. traveltoArg .. ' stalled - routing via Plane of Knowledge instead.')
     end
 
     -- 3. reach the PoK hub (fallback route). Gate tried first (AL, 2026-08-08: "Gate gets us to PoK,
     -- one way or another" - a single cast/AA/item click is usually faster than a computed /travelto
     -- route). Whatever it lands on - PoK directly (Stein) or close to it (bind/Guild Lobby/a spire) -
-    -- the /travelto POK_SHORT block right after finishes the hop if needed; its own guard condition
+    -- the /travelto zones.pokShort block right after finishes the hop if needed; its own guard condition
     -- just skips itself if gate already got us there, so no new fallback logic is needed here.
-    if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT and tryGate() then
-        waitUntil(function() return (mq.TLO.Zone.ShortName() or "") == POK_SHORT end, 25000, 500)
+    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort and tryGate() then
+        waitUntil(function() return (mq.TLO.Zone.ShortName() or "") == zones.pokShort end, 25000, 500)
     end
-    if (mq.TLO.Zone.ShortName() or "") ~= POK_SHORT then
-        -- v1.50: don't re-fire /travelto if we're already mid-flee toward POK_SHORT - fleeIfInCombat()
+    if (mq.TLO.Zone.ShortName() or "") ~= zones.pokShort then
+        -- v1.50: don't re-fire /travelto if we're already mid-flee toward zones.pokShort - fleeIfInCombat()
         -- already issued it. Re-issuing the SAME destination still resets EasyFind's routing progress
         -- from scratch (field-confirmed via repeated "Traveling to: The Plane of Knowledge" restarts in
         -- the same log), so every repeat combat ping was quietly sabotaging a travel that was actually
         -- working.
         if not justFledCombat then
-            mq.cmd('/travelto ' .. POK_SHORT)
+            mq.cmd('/travelto ' .. zones.pokShort)
         end
         if not waitWhileProgressing(function()
             if watchHalasExit then halasExitWatch() end
-            return (mq.TLO.Zone.ShortName() or "") == POK_SHORT
+            return (mq.TLO.Zone.ShortName() or "") == zones.pokShort
         end, 20000, 300000) then
             printIfRunning('\ar[Postmaster]\ax could not reach PoK - travel manually, then run again.')
             return false
@@ -1964,7 +2015,7 @@ local function travelToZone(traveltoArg, anchorNpc)
 end
 
 local function travelToQeynos()
-    return travelToZone(QEYNOS_TRAVELTO, VICUS_NAME)
+    return travelToZone(nonad.qeynosTravelto, nonad.vicus)
 end
 
 -- Warn BEFORE attempting to receive an item if there isn't room. Field bug (AL, fresh character):
@@ -1991,29 +2042,29 @@ local function getTonic()
 
     nonadBusy = true
 
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         travelToSunriseHills()
     end
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         print('\ar[Postmaster]\ax could not reach Sunrise Hills - travel there and run again.')
         nonadBusy = false
         return false
     end
-    if (mq.TLO.Spawn("npc " .. PAGUS_NAME).ID() or 0) == 0 then
-        print('\ar[Postmaster]\ax in Sunrise Hills but ' .. PAGUS_NAME .. ' not found - check VoA / instance.')
+    if (mq.TLO.Spawn("npc " .. nonad.pagus).ID() or 0) == 0 then
+        print('\ar[Postmaster]\ax in Sunrise Hills but ' .. nonad.pagus .. ' not found - check VoA / instance.')
         nonadBusy = false
         return false
     end
 
-    if not navToNpc(PAGUS_NAME) then nonadBusy = false; return false end
+    if not navToNpc(nonad.pagus) then nonadBusy = false; return false end
 
-    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. PAGUS_NAME).ID() or 0)
+    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. nonad.pagus).ID() or 0)
     mq.delay(300)
     local droppedInvis = dropInvisForInteraction()
     mq.cmd('/hail')
     mq.delay(1200)
     if droppedInvis then ensureInvisBuff() end
-    sayPhrase(PAGUS_NAME, BROTHER_PHRASE)
+    sayPhrase(nonad.pagus, nonad.brotherPhrase)
 
     -- The tonic may land on the cursor or straight in inventory; accept either, then stow it.
     local got = waitUntil(function()
@@ -2053,7 +2104,7 @@ end
 -- happened server-side - caller is responsible for travel/nav/inventory-space and being close to Vicus
 -- before calling this.
 local function requestTaxBoxFromVicus()
-    sayPhrase(VICUS_NAME, HELP_PHRASE)
+    sayPhrase(nonad.vicus, nonad.helpPhrase)
 
     -- Wait for the box, stow it.
     waitUntil(function()
@@ -2070,7 +2121,7 @@ local function requestTaxBoxFromVicus()
     end
 
     -- Vicus forgets the List of Debtors unless you ask - "What list?" (keyword [list]).
-    sayPhrase(VICUS_NAME, LIST_PHRASE)
+    sayPhrase(nonad.vicus, nonad.listPhrase)
     waitUntil(function()
         return (mq.TLO.FindItem("=" .. items.list).ID() or 0) > 0 or (mq.TLO.Cursor.Name() == items.list)
     end, 5000)
@@ -2104,11 +2155,11 @@ local function giveTonic()
     if not checkInventorySpace(2, items.box .. " + " .. items.list) then return false end
 
     nonadBusy = true
-    if (mq.TLO.Spawn("npc " .. VICUS_NAME).ID() or 0) == 0 then
+    if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(VICUS_NAME) then nonadBusy = false; return false end
-    if not giveItem(items.tonic, VICUS_NAME) then nonadBusy = false; return false end
+    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
+    if not giveItem(items.tonic, nonad.vicus) then nonadBusy = false; return false end
     mq.delay(1000)
     local ok = requestTaxBoxFromVicus()
     nonadBusy = false
@@ -2121,10 +2172,10 @@ end
 local function getTaxBoxDirect()
     if not checkInventorySpace(2, items.box .. " + " .. items.list) then return false end
     nonadBusy = true
-    if (mq.TLO.Spawn("npc " .. VICUS_NAME).ID() or 0) == 0 then
+    if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(VICUS_NAME) then nonadBusy = false; return false end
+    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
     local ok = requestTaxBoxFromVicus()
     nonadBusy = false
     return ok
@@ -2138,7 +2189,7 @@ end
 
 local function taxCount()
     local n = 0
-    for _, m in ipairs(TAX_MERCHANTS) do
+    for _, m in ipairs(tax.merchants) do
         if state.taxes[m] then n = n + 1 end
     end
     return n
@@ -2159,7 +2210,7 @@ local function syncTaxesFromBox()
     for j = 1, (container.Container() or 0) do
         local nm = container.Item(j).Name()
         if nm then
-            for _, m in ipairs(TAX_MERCHANTS) do
+            for _, m in ipairs(tax.merchants) do
                 local last = m:match("(%S+)$") or ""
                 if nm:find(m, 1, true) or (last ~= "" and nm:find(last, 1, true)) then
                     present[m] = true
@@ -2170,7 +2221,7 @@ local function syncTaxesFromBox()
     end
 
     local changed = false
-    for _, m in ipairs(TAX_MERCHANTS) do
+    for _, m in ipairs(tax.merchants) do
         local nowIn = present[m] or false
         if (state.taxes[m] or false) ~= nowIn then
             state.taxes[m] = nowIn
@@ -2202,18 +2253,18 @@ end
 
 -- Collect Sayer's tax straight from Flynn Merrington (North Qeynos) - Mira is skipped.
 local function collectViaFlynn()
-    print('\ay[Postmaster]\ax collecting Sayer\'s tax from ' .. FLYNN_NAME .. ' (skipping Mira)...')
-    travelToZone(FLYNN_ZONE, FLYNN_NAME)
-    if (mq.TLO.Spawn("npc " .. FLYNN_NAME).ID() or 0) == 0 then
-        print('\ar[Postmaster]\ax ' .. FLYNN_NAME .. ' not found - verify name / zone shortname.')
+    dbg('collecting Sayer\'s tax from ' .. tax.flynn .. ' (skipping Mira)...')
+    travelToZone(tax.flynnZone, tax.flynn)
+    if (mq.TLO.Spawn("npc " .. tax.flynn).ID() or 0) == 0 then
+        print('\ar[Postmaster]\ax ' .. tax.flynn .. ' not found - verify name / zone shortname.')
         return false
     end
-    if not navToNpc(FLYNN_NAME) then return false end
-    sayPhrase(FLYNN_NAME, FLYNN_PHRASE)
+    if not navToNpc(tax.flynn) then return false end
+    sayPhrase(tax.flynn, tax.flynnPhrase)
     if waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
         return putCursorInBox()
     end
-    print('\ar[Postmaster]\ax no tax from ' .. FLYNN_NAME .. ' - verify the exact phrase.')
+    print('\ar[Postmaster]\ax no tax from ' .. tax.flynn .. ' - verify the exact phrase.')
     return false
 end
 
@@ -2253,36 +2304,36 @@ local function collectTaxes()
         nonadBusy = false
         return false
     end
-    if (mq.TLO.Spawn("npc " .. VICUS_NAME).ID() or 0) == 0 then   -- Vicus = "am I in South Qeynos"
+    if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then   -- Vicus = "am I in South Qeynos"
         if not travelToQeynos() then nonadBusy = false; return false end
     end
 
-    for _, m in ipairs(TAX_MERCHANTS) do
+    for _, m in ipairs(tax.merchants) do
         if not running then break end
         if not state.taxes[m] then
-            if m == MIRA_NAME then
+            if m == tax.mira then
                 -- Mira is skipped - collect Sayer's tax straight from Flynn (North Qeynos)
                 if collectViaFlynn() then
                     state.taxes[m] = true
                     saveState()
-                    print(string.format('\ag[Postmaster]\ax boxed Sayer\'s tax via Flynn (%d/%d).', taxCount(), #TAX_MERCHANTS))
+                    print(string.format('\ag[Postmaster]\ax boxed Sayer\'s tax via Flynn (%d/%d).', taxCount(), #tax.merchants))
                 else
                     print('\ay[Postmaster]\ax could not collect Sayer\'s tax via Flynn - verify Flynn name / phrase.')
                 end
             else
                 -- travel to the merchant's home zone if they're not in the current one
-                if MERCHANT_ZONE[m] then
-                    travelToZone(MERCHANT_ZONE[m], m)
+                if tax.merchantZone[m] then
+                    travelToZone(tax.merchantZone[m], m)
                 end
                 if (mq.TLO.Spawn("npc " .. m).ID() or 0) == 0 then
                     print('\ay[Postmaster]\ax merchant not found: ' .. m .. ' (verify name / zone shortname)')
                 elseif navToNpc(m) then
-                    sayPhrase(m, TAX_PHRASE)
+                    sayPhrase(m, tax.phrase)
                     if waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
                         if putCursorInBox() then
                             state.taxes[m] = true
                             saveState()
-                            print(string.format('\ag[Postmaster]\ax boxed tax from %s (%d/%d).', m, taxCount(), #TAX_MERCHANTS))
+                            print(string.format('\ag[Postmaster]\ax boxed tax from %s (%d/%d).', m, taxCount(), #tax.merchants))
                         else
                             print('\ar[Postmaster]\ax could not box the tax from ' .. m .. ' - check box slot / cursor.')
                         end
@@ -2295,7 +2346,7 @@ local function collectTaxes()
     end
 
     local n = taxCount()
-    if n >= #TAX_MERCHANTS then
+    if n >= #tax.merchants then
         print('\ag[Postmaster]\ax all ' .. n .. ' taxes boxed - combining...')
         local combined = combineBox()
         if combined then
@@ -2308,7 +2359,7 @@ local function collectTaxes()
     end
     -- Not all 10 collected this pass (a merchant was unreachable/didn't respond) - stop here rather
     -- than loop on the same failure; AL can retry once the field issue (name/zone/faction) is fixed.
-    print(string.format('\ay[Postmaster]\ax %d/%d taxes boxed so far.', n, #TAX_MERCHANTS))
+    print(string.format('\ay[Postmaster]\ax %d/%d taxes boxed so far.', n, #tax.merchants))
     nonadBusy = false
     return false
 end
@@ -2320,11 +2371,11 @@ local function returnToVicus()
         return false
     end
     nonadBusy = true
-    if (mq.TLO.Spawn("npc " .. VICUS_NAME).ID() or 0) == 0 then
+    if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(VICUS_NAME) then nonadBusy = false; return false end
-    if not giveItems({ items.fullbox, items.list }, VICUS_NAME) then
+    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
+    if not giveItems({ items.fullbox, items.list }, nonad.vicus) then
         nonadBusy = false
         return false
     end
@@ -2343,30 +2394,30 @@ end
 
 -- RETURN_PAGUS: report to Pagus in Sunrise Hills to finish The Nonad Brothers.
 local function returnToPagus()
-    if not checkInventorySpace(1, NONAD_REWARD) then return false end
+    if not checkInventorySpace(1, nonad.reward) then return false end
     nonadBusy = true
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         travelToSunriseHills()
     end
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         print('\ar[Postmaster]\ax could not reach Sunrise Hills - travel there and run again.')
         nonadBusy = false
         return false
     end
-    if (mq.TLO.Spawn("npc " .. PAGUS_NAME).ID() or 0) == 0 then
-        print('\ar[Postmaster]\ax in Sunrise Hills but ' .. PAGUS_NAME .. ' not found - check VoA / instance.')
+    if (mq.TLO.Spawn("npc " .. nonad.pagus).ID() or 0) == 0 then
+        print('\ar[Postmaster]\ax in Sunrise Hills but ' .. nonad.pagus .. ' not found - check VoA / instance.')
         nonadBusy = false
         return false
     end
-    if not navToNpc(PAGUS_NAME) then nonadBusy = false; return false end
-    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. PAGUS_NAME).ID() or 0)
+    if not navToNpc(nonad.pagus) then nonadBusy = false; return false end
+    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. nonad.pagus).ID() or 0)
     mq.delay(300)
     local droppedInvis = dropInvisForInteraction()
     mq.cmd('/hail')
     if droppedInvis then ensureInvisBuff() end
     -- Pagus hands over the reward figure - wait for it, stow it, use it as the completion flag
     local rewarded = waitUntil(function()
-        return (mq.TLO.FindItem("=" .. NONAD_REWARD).ID() or 0) > 0 or (mq.TLO.Cursor.Name() == NONAD_REWARD)
+        return (mq.TLO.FindItem("=" .. nonad.reward).ID() or 0) > 0 or (mq.TLO.Cursor.Name() == nonad.reward)
     end, 6000)
     for _ = 1, 4 do
         if (mq.TLO.Cursor.ID() or 0) == 0 then break end
@@ -2388,8 +2439,8 @@ end
 -- permanent flag and survives placing the figure later.
 local function detectNonadReward()
     if state.nonadDone then return end
-    if (mq.TLO.FindItem("=" .. NONAD_REWARD).ID() or 0) > 0
-        or (mq.TLO.FindItemBank("=" .. NONAD_REWARD).ID() or 0) > 0 then
+    if (mq.TLO.FindItem("=" .. nonad.reward).ID() or 0) > 0
+        or (mq.TLO.FindItemBank("=" .. nonad.reward).ID() or 0) > 0 then
         state.nonadDone = true
         saveState()
         print('\ag[Postmaster]\ax Nonad reward figure detected - The Nonad Brothers marked complete.')
@@ -2595,8 +2646,8 @@ end
 
 local function startChallenge()
     pmBusy = true
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then travelToSunriseHills() end
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then travelToSunriseHills() end
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         print('\ar[Postmaster]\ax could not reach Sunrise Hills - travel there and run again.')
         pmBusy = false
         return false
@@ -2669,7 +2720,7 @@ end
 -- travel at Sneak's reduced speed for zero safety benefit, since those zones are never dangerous.
 local function inSafeHubZone()
     local zid = mq.TLO.Zone.ID() or 0
-    return (mq.TLO.Zone.ShortName() or "") == POK_SHORT or zid == GUILD_LOBBY_ZONE or zid == NEIGHBORHOOD_ZONE
+    return (mq.TLO.Zone.ShortName() or "") == zones.pokShort or zid == zones.guildLobby or zid == zones.neighborhood
 end
 
 -- AL, 2026-08-11: arrived in PoK "beat up a bit" after escaping Erudin, then died to the Halas zone-in
@@ -2679,14 +2730,13 @@ end
 -- in this pipeline. Return value is meaningful (unlike the other ensure* functions) - true only if it
 -- actually paused to heal, so waitWhileProgressing's caller can reset its stuck-detection timer;
 -- otherwise a multi-minute heal would look like a navigation stall the instant polling resumes.
-local HEAL_WAIT_MS = 180000
 
 ensureHealed = function()
     if not inSafeHubZone() then return false end
     if (mq.TLO.Me.PctHPs() or 100) >= 100 then return false end
     print('\ay[Postmaster]\ax healing up before continuing (' .. tostring(mq.TLO.Me.PctHPs()) .. '% HP)...')
     mq.cmd('/sit on')
-    waitUntil(function() return (mq.TLO.Me.PctHPs() or 100) >= 100 end, HEAL_WAIT_MS, 2000)
+    waitUntil(function() return (mq.TLO.Me.PctHPs() or 100) >= 100 end, tuning.healWaitMs, 2000)
     mq.cmd('/stand')
     if (mq.TLO.Me.PctHPs() or 100) >= 100 then
         print('\ag[Postmaster]\ax fully healed - continuing.')
@@ -2810,7 +2860,7 @@ fleeIfInCombat = function()
     if (mq.TLO.Me.CombatState() or ""):upper() ~= "COMBAT" then return false end
     -- v1.50: idempotent - only react on the FIRST combat detection this attempt, not every repeat ping.
     -- AL, 2026-08-14 field log: a real flee-in-progress kept getting re-triggered by every subsequent
-    -- combat tick, each one re-firing /travelto POK_SHORT - which resets EasyFind's routing progress
+    -- combat tick, each one re-firing /travelto zones.pokShort - which resets EasyFind's routing progress
     -- from scratch every time (confirmed: each call produced a fresh "Traveling to: X" + restarted the
     -- first hop), so a travel that was actually working never got the chance to finish. Once already
     -- fleeing, the existing /travelto is still the right response - a repeat hit doesn't need a NEW
@@ -2833,7 +2883,7 @@ fleeIfInCombat = function()
         mq.cmd('/doability "Sneak"')
         radiusWatchLatched = false
     end
-    mq.cmd('/travelto ' .. POK_SHORT)
+    mq.cmd('/travelto ' .. zones.pokShort)
     return true
 end
 
@@ -2853,8 +2903,6 @@ end
 -- check also passed. interactFn is called once positioned (and unhidden, if stealth was used) - its
 -- return value becomes this function's return value. Handles re-hiding after and combat-flee around the
 -- exposed moment; interactFn only needs to do the actual say/give.
-local STICK_DISTANCE = 12   -- starting guess (no field data on ideal range yet), matches this project's
-                             -- existing pattern of a single named starting-guess constant, tune later.
 
 -- Position behind an NPC via /stick (MQ2MoveUtils, confirmed loaded - RGMercs' own
 -- rog_class_config.lua uses the identical "behind" arg for Backstab
@@ -2868,7 +2916,7 @@ local function stickBehind(npcName)
         return false
     end
     local id = mq.TLO.Spawn("npc " .. npcName).ID() or 0
-    mq.cmdf('/stick %d id %d behind', STICK_DISTANCE, id)
+    mq.cmdf('/stick %d id %d behind', tuning.stickDistance, id)
     local gotBehind = false
     local stickElapsed = 0
     while stickElapsed < 15000 do
@@ -2878,7 +2926,7 @@ local function stickBehind(npcName)
         stickElapsed = stickElapsed + 200
     end
     if not gotBehind then
-        print('\ay[Postmaster]\ax could not confirm behind ' .. npcName .. ' - proceeding anyway.')
+        dbg('could not confirm behind ' .. npcName .. ' - proceeding anyway.')
     end
     mq.cmd('/stick off')
     mq.delay(300)
@@ -2958,9 +3006,9 @@ radiusWatch = function()
                                           -- bother scanning at all, same reasoning ensureHealed already
                                           -- uses these zones for (see inSafeHubZone's own comment)
 
-    local count = mq.TLO.SpawnCount("npc radius " .. GUARD_PROXIMITY_RADIUS)() or 0
+    local count = mq.TLO.SpawnCount("npc radius " .. tuning.guardRadius)() or 0
     for i = 1, count do
-        local spawn = mq.TLO.NearestSpawn(i, "npc radius " .. GUARD_PROXIMITY_RADIUS)
+        local spawn = mq.TLO.NearestSpawn(i, "npc radius " .. tuning.guardRadius)
         local id = spawn.ID() or 0
         if id > 0 and not radiusWatchConsidered[id] then
             radiusWatchConsidered[id] = true
@@ -3015,7 +3063,7 @@ local function approachAndInteract(npcName, interactFn)
                         safe = true
                         break
                     end
-                    print('\ay[Postmaster]\ax ' .. npcName .. ' still reads hostile (' .. tostring(reaction) .. ') - retrying hide...')
+                    dbg(npcName .. ' still reads hostile (' .. tostring(reaction) .. ') - retrying hide...')
                 end
                 if not safe then
                     print('\ar[Postmaster]\ax could not get a safe reading on ' .. npcName .. ' after 3 attempts.')
@@ -3249,8 +3297,8 @@ end
 
 finishChallenge = function()
     pmBusy = true
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then travelToSunriseHills() end
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then travelToSunriseHills() end
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         print('\ar[Postmaster]\ax could not reach Sunrise Hills - travel there and run again.')
         pmBusy = false
         return false
@@ -3387,8 +3435,8 @@ runLysricStep = function()
     if not checkInventorySpace(1, items.satchel) then return false end
     ui.lysricMsg = nil
     lysricBusy = true
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then travelToSunriseHills() end
-    if mq.TLO.Zone.ID() ~= NEIGHBORHOOD_ZONE then
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then travelToSunriseHills() end
+    if mq.TLO.Zone.ID() ~= zones.neighborhood then
         print('\ar[Postmaster]\ax could not reach Sunrise Hills - travel there and run again.')
         lysricBusy = false
         return false
@@ -4534,7 +4582,7 @@ function ui.mini()
         if bagLocation ~= nil or state.lysricDone then
             label = "Satchel obtained"
         elseif not state.nonadDone then
-            label = string.format("Taxes %d/%d", taxCount(), #TAX_MERCHANTS)
+            label = string.format("Taxes %d/%d", taxCount(), #tax.merchants)
         else
             label = string.format("Deliveries %d/%d", deliveredCount(), #DELIVERIES)
         end
@@ -4605,7 +4653,7 @@ function ui.overview()
     -- TRANSITION - activeSection changing value from the previous frame - never every frame, so
     -- manual clicks in between transitions are still yours, we don't fight them.
     imgui.Separator()
-    local inNeighborhood = mq.TLO.Zone.ID() == NEIGHBORHOOD_ZONE
+    local inNeighborhood = mq.TLO.Zone.ID() == zones.neighborhood
     if inNeighborhood then reachedNeighborhoodOnce = true end
     local satchelDone = bagLocation ~= nil or state.lysricDone
     local activeSection
@@ -4723,7 +4771,7 @@ function ui.overview()
                 ui.taxDirty = false
                 imgui.SetNextItemOpen(ui.taxActive, ImGuiCond.Always)
             end
-            if imgui.CollapsingHeader(string.format("Tax merchants  [ %d / %d ]###taxList", taxCount(), #TAX_MERCHANTS)) then
+            if imgui.CollapsingHeader(string.format("Tax merchants  [ %d / %d ]###taxList", taxCount(), #tax.merchants)) then
                 imgui.Indent(12)
                 -- Row layout borrowed from the original mockup's postmaster list: a small glyph, the
                 -- name, and the state as a right-aligned WORD rather than a bracket prefix - the eye
@@ -4737,15 +4785,15 @@ function ui.overview()
                 -- would mean reasoning about how Indent, WindowPadding and SameLine's origin
                 -- interact - measured, that is 370px of content in ~492px of space, so the fit is
                 -- comfortable either way, but this version cannot get the origin wrong.
-                local taxRows = math.ceil(#TAX_MERCHANTS / 2)
+                local taxRows = math.ceil(#tax.merchants / 2)
                 local taxColW = (imgui.GetWindowWidth() - 36) / 2
                 local taxColH = imgui.GetTextLineHeightWithSpacing() * taxRows
                 imgui.BeginChild("##taxcolL", taxColW, taxColH, false)
-                for i = 1, taxRows do ui.taxCell(TAX_MERCHANTS[i]) end
+                for i = 1, taxRows do ui.taxCell(tax.merchants[i]) end
                 imgui.EndChild()
                 imgui.SameLine(0, 10)
                 imgui.BeginChild("##taxcolR", taxColW, taxColH, false)
-                for i = taxRows + 1, #TAX_MERCHANTS do ui.taxCell(TAX_MERCHANTS[i]) end
+                for i = taxRows + 1, #tax.merchants do ui.taxCell(tax.merchants[i]) end
                 imgui.EndChild()
                 imgui.Unindent(12)
             end
