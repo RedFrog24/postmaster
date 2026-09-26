@@ -14,7 +14,7 @@ local imgui = require('ImGui')
 local launchArgs = { ... }
 
 -- Preflight (computed once - these do not change mid-session)
-local version = "2.24"
+local version = "2.28"
 local myName = mq.TLO.Me.Name() or "unknown"
 local myRace = mq.TLO.Me.Race() or "Unknown"
 local myServer = mq.TLO.EverQuest.Server() or "unknown"
@@ -68,6 +68,27 @@ tuning.shroudLevel = 60
 -- STARTING GUESS, no field data on the ideal range yet. How close `/stick ... behind` is told to sit
 -- when approaching a hostile NPC from behind.
 tuning.stickDistance = 12
+
+-- How far short of an NPC a walk stops (MQ2Nav's `distance=`, which also waits for line of sight to the
+-- NPC before it counts as there). Without it nav aims for the very spot the NPC stands ON, and for a
+-- merchant behind a counter or a bartender behind the bar that means walking into the woodwork and
+-- grinding against it - going in, and again coming out (player report, 2026-09-25: Ton Firepride and
+-- Tasya Huntlan in South Qeynos). 14 is what public scripts that hand items to NPCs already stop at -
+-- lsgift walks up with `dist=14 los=on` and then opens the give window with `/click left target`,
+-- exactly the give this script does - so it is inside hand-in range as well as /say range.
+tuning.npcStop = 14
+
+-- The MQ2AutoSize self size that gets a character cleanly over Ton Firepride's counter in South Qeynos,
+-- which has little room above it. MEASURED at Ton (AL, 2026-09-25), two races:
+--   Drakkin (natural size 6, 4.06 tall):  10 won't fit the shop door, 8 hits the ceiling on the counter,
+--                                          5 sticks, 4 CLEAN (2.70 tall)
+--   Vah Shir (natural size 7, 4.37 tall): natural gets a little stuck, 3 a little difficulty, 4 CLEAN
+--                                          (2.49 tall)
+-- Clean at 4 on both, and SMALLER was worse, not better - so v2.28 sets exactly this size for everyone
+-- (AL: "size 4 for everyone") rather than v2.27's "2.70 or shorter", which left anyone already smaller
+-- (AL's own everyday size 3) at the size that struggled. Height is linear in size per race, and two races
+-- cannot yet say whether the size or the height is what counts; a gnome or an ogre at 4 would.
+tuning.counterSize = 4
 
 -- How long to keep waiting for health to come back before giving up and carrying on regardless.
 tuning.healWaitMs = 180000
@@ -188,6 +209,10 @@ local state = {
     soundOn = true,      -- WAV chimes on milestones (played with /beep, Windows PlaySound)
     ttsOn = false,       -- speak milestones via MQTextToSpeech; off by default, it is intrusive
     ttsVoice = "",       -- last voice set from the picker, purely informational
+    fitCounters = true,  -- "Fit through counters": shrink via MQ2AutoSize while running (see `fit`). ON by
+                          -- default (v2.27, AL) so every player gets it; untickable in Settings.
+    autosizeRestore = {},-- the player's own AutoSize settings while we have them changed; empty = nothing
+                          -- to put back. On DISK on purpose - see fit.apply.
 }
 
 -- Persistence
@@ -418,6 +443,94 @@ local function waitWhileProgressing(cond, stuckAfterMs, ceilingMs, stepMs)
         elapsed = elapsed + stepMs
     end
     return false
+end
+
+-- "Fit through counters" (v2.26, AL's idea) - MQ2AutoSize sets the character to the size that gets over
+-- Ton Firepride's counter cleanly (the measurements are on tuning.counterSize). ON by default, untickable
+-- in Settings (v2.27). A fixed size for everyone since v2.28.
+--
+-- v2.27, AL: load the plugin ourselves when the player doesn't run it, and unload it at the end ONLY if we
+-- were the ones who loaded it - otherwise most players would never get the fix. A player who already runs
+-- AutoSize gets their own settings back at the end, not a reset (AL's choice: "their own settings back").
+-- `noauto` on the load, so MacroQuest.ini never learns about it and it does not follow them to other
+-- characters. This is a deliberate exception to the studio rule of never unloading at exit - safe here
+-- because we only ever unload what we loaded ourselves.
+--
+-- WHY THE ORIGINALS ARE SAVED TO DISK, NOT JUST HELD IN A VARIABLE: with AutoSave on, every /autosize
+-- change is written to the plugin's own INI at once. A /lua stop kills this script without reaching the
+-- restore after the main loop, so a memory-only copy would leave the player's SAVED size shrunk for good -
+-- and the next run would then capture that shrunk size as "their" setting and never undo it. Saved here
+-- before anything changes, the originals survive a stop or a crash and are put back at the next start.
+--
+-- Driven from the main loop through fit.request, never from the Settings checkbox itself: apply waits for
+-- the resize to land, and nothing may wait inside the render thread.
+local fit = { request = nil }
+
+-- Makes sure MQ2AutoSize is loaded. Returns (loaded, loadedByThisCall). The root plugin pattern: `load`,
+-- never a bare `/plugin` (that toggles, and would UNLOAD a loaded one); `noauto`; verify after, and say
+-- which feature is off if it will not load (the DLL may simply not be there). mq.delay rather than
+-- waitUntil because the end-of-script restore runs after `running` has gone false, and waitUntil gives
+-- up at once when it has.
+function fit.load()
+    if mq.TLO.Plugin('MQ2AutoSize').IsLoaded() then return true, false end
+    mq.cmd('/squelch /plugin mq2autosize load noauto')
+    mq.delay(5000, function() return mq.TLO.Plugin('MQ2AutoSize').IsLoaded() == true end)
+    if not mq.TLO.Plugin('MQ2AutoSize').IsLoaded() then
+        print('\ay[Postmaster]\ax could not load MQ2AutoSize - Fit through counters is off. If you snag on a '
+            .. 'counter, the stuck-nudge still works.')
+        return false, false
+    end
+    return true, true
+end
+
+-- Loads the plugin if it has to, because a record on disk can outlive the plugin: /lua stop or a crash,
+-- then EQ restarted, and a plugin we loaded with `noauto` is gone - yet its INI still holds OUR size.
+-- Loading it just to write the player's values back is the only way to repair that.
+function fit.restore()
+    local s = state.autosizeRestore
+    if not s.size then return end
+    local ok, loadedNow = fit.load()
+    if not ok then return end   -- keep the record; the next start tries again
+    if s.size >= 1 then mq.cmdf('/squelch /autosize sizeself %d', s.size) end
+    if not s.self then mq.cmd('/squelch /autosize self off') end
+    if not s.enabled then mq.cmd('/squelch /autosize off') end
+    if s.weLoaded or loadedNow then mq.cmd('/squelch /plugin mq2autosize unload') end
+    state.autosizeRestore = {}
+    saveState()
+    print('\ag[Postmaster]\ax your character size is back as it was.')
+end
+
+function fit.apply()
+    if state.autosizeRestore.size then return end   -- already applied
+    local ok, loadedNow = fit.load()
+    if not ok then return end
+    local a = mq.TLO.AutoSize
+    -- Already exactly where we would put them (a player's own AutoSize at this size): nothing to change,
+    -- and nothing to undo. Only when THEY had it loaded - if we just loaded it, the record below is what
+    -- makes the end-of-run unload happen, so it must be written even if the size already matches.
+    if not loadedNow and a.Enabled() and a.ResizeSelf() and (a.SizeSelf() or 0) == tuning.counterSize then
+        dbg(string.format('already at AutoSize size %d - nothing to change.', tuning.counterSize))
+        return
+    end
+    state.autosizeRestore = { enabled = a.Enabled() == true, self = a.ResizeSelf() == true,
+        size = a.SizeSelf() or 0, weLoaded = loadedNow }
+    saveState()
+    -- Explicit on/off forms (MQ docs: `/autosize [on|off]`, `/autosize self [on|off]`), never the bare
+    -- toggles - a toggle sent against the wrong starting state would do the opposite of what we meant.
+    if not state.autosizeRestore.enabled then mq.cmd('/squelch /autosize on') end
+    if not state.autosizeRestore.self then mq.cmd('/squelch /autosize self on') end
+    local before = mq.TLO.Me.Height() or 0
+    mq.cmdf('/squelch /autosize sizeself %d', tuning.counterSize)
+    if not waitUntil(function() return (mq.TLO.AutoSize.SizeSelf() or 0) == tuning.counterSize end, 3000, 100) then
+        print('\ay[Postmaster]\ax Fit through counters could not set your size - putting your AutoSize settings back.')
+        fit.restore()
+        return
+    end
+    -- The setting reads back at once; the model catches up a moment later. Wait briefly for the height to
+    -- move so the line below reports the real result (it will not move if they were already this size).
+    waitUntil(function() return math.abs((mq.TLO.Me.Height() or 0) - before) > 0.01 end, 1500, 100)
+    print(string.format('\ay[Postmaster]\ax Fit through counters: set you to size %d (%.2f tall) so you fit over '
+        .. 'shop counters. Your normal size comes back when Postmaster closes.', tuning.counterSize, mq.TLO.Me.Height() or 0))
 end
 
 -- Skips a failure print if the true cause was the user closing the script (running went false) mid-wait,
@@ -1326,51 +1439,114 @@ local function navToNpc(name)
     -- Movement: unconditional, for everyone (see ensureMovementBuff's own comment). Invis/guard-watch:
     -- only for factionRisk characters below the level where guard aggro stops mattering.
     local watchGuards = factionRisk and (mq.TLO.Me.Level() or 0) < tuning.factionRiskLevel
+    local function farFrom(range) return (mq.TLO.Spawn("id " .. id).Distance3D() or 999) > range end
+    -- The player closes the last bit by hand and we carry on the moment they are within `range`.
+    local function waitForPlayer(range)
+        if not waitUntil(function() return not farFrom(range) end, 600000, 1000) then
+            printIfRunning('\ar[Postmaster]\ax still not near ' .. name .. ' - stopping. Get to them, then run again.')
+            return false
+        end
+        print('\ag[Postmaster]\ax near ' .. name .. ' - continuing.')
+        return true
+    end
+
+    -- One walk: fire the nav and watch it until it ends. Returns (pinned, ended) - `pinned` true means the
+    -- character stayed caught on something after every nudge below, `ended` false means a timeout.
+    --
+    -- Checks tryErudinGem and the guard proximity watch on every poll while nav is still active - same
+    -- shape as halasExitWatch, catches a guard that comes into range mid-walk, not just whatever was
+    -- nearby at the start.
+    --
+    -- STUCK WATCH (v2.25). Nav can leave a character pressed against a counter, a bar or a table it
+    -- cannot get past, and before this the wait just sat there until its three-minute timeout. A player
+    -- (2026-09-25) found the manual cure: duck a few times, or pause and shuffle them about. So: nav
+    -- still running, not paused, and the character has moved under 2 units in 4 seconds -> pause, duck
+    -- and stand (and from the second try, step back a pace), resume. Three tries per NPC, then hand over.
+    local nudges = 0
+    local function walk(timeoutMs)
+        mq.cmdf('/nav id %d distance=%d log=off', id, tuning.npcStop)
+        mq.delay(500)   -- let pathing engage before we watch Navigation.Active
+        local ax, ay, az = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
+        local since, lastPoll = mq.gettime(), mq.gettime()
+        local pinned = false
+        local ended = waitUntil(function()
+            if watchErudinGem then tryErudinGem() end
+            if watchGuards and guardNearby() then ensureInvisBuff() end
+            if not mq.TLO.Navigation.Active() then return true end
+            local now = mq.gettime()
+            local x, y, z = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
+            -- The stuck clock only runs across ordinary back-to-back polls of an unpaused walk. A long gap
+            -- between polls means something else held the loop (a cast, the Erudin gem nudge, a stealth
+            -- check), and a pause is the player's own - neither is the character being stuck.
+            if mq.TLO.Navigation.Paused() or now - lastPoll > 750
+                or math.sqrt((x - ax) ^ 2 + (y - ay) ^ 2 + (z - az) ^ 2) > 2 then
+                ax, ay, az, since = x, y, z, now
+            elseif now - since > 4000 then
+                if nudges >= 3 then
+                    pinned = true
+                    return true
+                end
+                nudges = nudges + 1
+                print(string.format('\ay[Postmaster]\ax caught on something on the way to %s - working free (%d/3)...', name, nudges))
+                mq.cmd('/nav pause')   -- safe here: nav is active, which is the only time a pause is accepted
+                mq.cmd('/keypress duck')
+                mq.delay(500)
+                if mq.TLO.Me.Ducking() then mq.cmd('/keypress duck') end
+                if nudges > 1 then
+                    mq.cmd('/keypress back hold')
+                    mq.delay(600)
+                    mq.cmd('/keypress back')
+                end
+                mq.cmd('/nav pause off')
+                -- Active can read false around a pause, and the very next poll would take that as "nav
+                -- finished" and hand the NPC over from the far side of the counter. Let it come back first.
+                mq.delay(1000, function() return mq.TLO.Navigation.Active() == true end)
+                ax, ay, az, since = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0, mq.gettime()
+            end
+            lastPoll = mq.gettime()
+            return false
+        end, timeoutMs, 200)
+        return pinned, ended
+    end
+
     ensureMovementBuff()
-    mq.cmdf('/nav id %d log=off', id)
-    mq.delay(500)   -- let pathing engage before we watch Navigation.Active
     -- 180s covers a long run across a huge zone (e.g. West Karana zone-in -> the fishing village).
-    -- Checks tryErudinGem and the guard proximity watch on every poll while nav is still active (not
-    -- after, like the Kelethin lift below) - same shape as halasExitWatch, catches a guard that comes
-    -- into range mid-walk, not just whatever was nearby at the start.
-    if not waitUntil(function()
-        if watchErudinGem then tryErudinGem() end
-        if watchGuards and guardNearby() then ensureInvisBuff() end
-        return not mq.TLO.Navigation.Active()
-    end, 180000, 200) then
+    local pinned, ended = walk(180000)
+    if not ended then
         printIfRunning('\ar[Postmaster]\ax nav to ' .. name .. ' timed out.')
         return false
     end
     -- Nav reports "done" even when it never found a path (mesh gap - e.g. the Kelethin lifts leave the
     -- treetop NPCs off the ground mesh). Verify we actually arrived; if not, assist: AL rides/walks the
     -- last bit and we resume on proximity. Also fixes the old silent "say from across the zone" failure.
-    if (mq.TLO.Spawn("id " .. id).Distance3D() or 999) > 30 then
+    if not pinned and farFrom(30) then
         -- In Kelethin the gap is usually the ground->platform lift. Try the FELE2 auto-ride, then re-nav.
         if (mq.TLO.Zone.ShortName() or "") == "gfaydark" and rideKelethinLift() then
-            mq.cmdf('/nav id %d log=off', id)
-            mq.delay(500)
-            waitUntil(function() return not mq.TLO.Navigation.Active() end, 120000, 200)
+            pinned = walk(120000)
         end
         -- Nav can silently whiff right after a scripted position change (e.g. stepping off the Halas
         -- shuttle) - the mesh isn't "warm" yet and /nav id reports done almost instantly with no real
         -- path, so the character never moves at all. Field-confirmed: a bare re-fire moments later just
         -- works, no genuine gap involved - cheap to try before assuming one and asking AL to close it.
-        if (mq.TLO.Spawn("id " .. id).Distance3D() or 999) > 30 then
+        if not pinned and farFrom(30) then
             mq.delay(1000)
-            mq.cmdf('/nav id %d log=off', id)
-            mq.delay(500)
-            waitUntil(function() return not mq.TLO.Navigation.Active() end, 180000, 200)
+            pinned = walk(180000)
         end
-        -- Still short (more platforms/bridges, or lift unavailable) -> assist: AL closes the gap.
-        if (mq.TLO.Spawn("id " .. id).Distance3D() or 999) > 30 then
-            print('\ay[Postmaster]\ax cannot auto-reach ' .. name .. ' (nav gap - e.g. a Kelethin lift). '
-                .. 'Ride/walk up to them; I will continue when you are close.')
-            if not waitUntil(function() return (mq.TLO.Spawn("id " .. id).Distance3D() or 999) <= 30 end, 600000, 1000) then
-                printIfRunning('\ar[Postmaster]\ax still not near ' .. name .. ' - stopping. Get to them, then run again.')
-                return false
-            end
-            print('\ag[Postmaster]\ax near ' .. name .. ' - continuing.')
-        end
+    end
+    -- Pinned: re-firing the same nav would walk straight back into the same snag, so go straight to the
+    -- hand-over. The bar is the stop distance itself (plus a hair for rounding), not the looser 30 used
+    -- for a mesh gap - pinned against a counter can already be inside 30 while still out of reach.
+    if pinned then
+        mq.cmd('/nav stop')
+        print('\ay[Postmaster]\ax stuck on the way to ' .. name .. ' and could not work free. '
+            .. 'Walk them up to ' .. name .. '; I will continue when you are close.')
+        return waitForPlayer(tuning.npcStop + 1)
+    end
+    -- Still short (more platforms/bridges, or lift unavailable) -> assist: AL closes the gap.
+    if farFrom(30) then
+        print('\ay[Postmaster]\ax cannot auto-reach ' .. name .. ' (nav gap - e.g. a Kelethin lift). '
+            .. 'Ride/walk up to them; I will continue when you are close.')
+        return waitForPlayer(30)
     end
     return true
 end
@@ -5092,6 +5268,23 @@ function ui.settings()
     end
 
     imgui.Separator()
+    coloredText(0.90, 0.76, 0.36, "Travel")
+    -- The click only records the wish; the main loop does the resizing (fit.request), since applying it
+    -- waits for the new size to land and the render thread must never wait.
+    local beforeFit = state.fitCounters
+    state.fitCounters = imgui.Checkbox("Fit through counters", state.fitCounters)
+    if state.fitCounters ~= beforeFit then
+        saveState()
+        fit.request = state.fitCounters
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip("Some shopkeepers stand behind a counter with little\nroom above it, and a full-size "
+            .. "character gets stuck\nclimbing over. This sets you to MQ2AutoSize size 4\nwhile Postmaster is "
+            .. "running - the size that got over\ncleanly in testing.\n\nIf you don't use MQ2AutoSize, Postmaster loads it\nfor the run and "
+            .. "unloads it after. If you do, your\nown settings are saved first and put back.")
+    end
+
+    imgui.Separator()
     coloredText(0.90, 0.76, 0.36, "Sounds")
     local beforeSound = state.soundOn
     state.soundOn = imgui.Checkbox("Sound (master - all Postmaster sounds)", state.soundOn)
@@ -5310,6 +5503,11 @@ for _, a in ipairs(launchArgs) do
     if a:lower() == 'travel' or a:lower() == 'go' then travelRequested = true end
 end
 
+-- A record left on disk means the last session ended without its restore (a /lua stop or a crash) - put
+-- the player's own AutoSize settings back FIRST, so a fresh apply captures their real ones, not ours.
+fit.restore()
+if state.fitCounters then fit.request = true end
+
 local lastPoll = 0
 while running do
     mq.doevents()
@@ -5322,6 +5520,11 @@ while running do
         print('\ag[Postmaster]\ax no longer shrouded - back to normal form.')
     end
     lastShroudedState = nowShrouded
+    if fit.request ~= nil then
+        local want = fit.request
+        fit.request = nil
+        if want then fit.apply() else fit.restore() end
+    end
     if travelRequested then
         travelRequested = false
         travelToSunriseHills()
@@ -5373,3 +5576,7 @@ while running do
     end
     mq.delay(250)
 end
+
+-- Closing with X or /postmaster exit lands here. A /lua stop does not - that case is caught at the next
+-- start instead, from the record fit.apply saved to disk.
+fit.restore()
