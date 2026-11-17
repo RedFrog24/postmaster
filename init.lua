@@ -14,7 +14,7 @@ local imgui = require('ImGui')
 local launchArgs = { ... }
 
 -- Preflight (computed once - these do not change mid-session)
-local version = "2.28"
+local version = "2.68"
 local myName = mq.TLO.Me.Name() or "unknown"
 local myRace = mq.TLO.Me.Race() or "Unknown"
 local myServer = mq.TLO.EverQuest.Server() or "unknown"
@@ -154,6 +154,7 @@ local lysricBusy = false
 -- point and needs to record its outcome for the Final Hail panel to display.
 local ui = {}
 ui.lysricMsg = nil          -- last Lysric outcome, shown inline in the panel
+ui.sharedSatchels = 0       -- satchels in the account-wide SHARED bank (poll); may be another character's
 ui.lysricMsgCol = nil
 ui.sayQueue = {}            -- FIFO of {text, xml}; drained by the main loop, paced so lines cannot
 ui.sayNextAt = 0            -- cut each other off (SPF_PURGEBEFORESPEAK - see TTS_REFERENCE.md)
@@ -201,9 +202,11 @@ local state = {
     taxes = {},          -- [merchantName] = true once their tax is collected + boxed
     taxesInVicus = false,-- Full box handed to Vicus; only the Pagus report remains
     factionAck = false,
-    neighborhood = "Alliance",   -- name typed into the Guild Lobby gate selector; "Alliance" is a
-                                 -- default public neighborhood that exists on every server, so there's
-                                 -- nothing to look up - type your own name here only if you'd rather.
+    neighborhood = "Alliance of the Forsaken Village",   -- typed into the Guild Lobby gate's search. The
+                                 -- public neighborhood on every server - by its FULL name (v2.31, AL).
+                                 -- The default was the bare word "Alliance" until then, and a search for
+                                 -- that also returns guild and player neighborhoods with it in their name:
+                                 -- travel took row 1 and could land in somebody's personal neighborhood.
     theme = "Ledger",   -- key into ui.THEMES. Chooses BOTH the palette and whether the artwork draws
                          -- at all: a theme without `art` is a plain, wordmark-only look.
     soundOn = true,      -- WAV chimes on milestones (played with /beep, Windows PlaySound)
@@ -213,7 +216,21 @@ local state = {
                           -- default (v2.27, AL) so every player gets it; untickable in Settings.
     autosizeRestore = {},-- the player's own AutoSize settings while we have them changed; empty = nothing
                           -- to put back. On DISK on purpose - see fit.apply.
+    factionGoal = "Apprehensive",   -- Faction tab: the Reaction a helper quest stops at (v2.29). The
+                                    -- default is what Vicus Nonad needs before he will talk.
+    factionGoals = {},   -- v2.58: one Stop at per helper, by key (AL's decision 2 - Apprehensive for Antonius
+                          -- Bayle, Ally for the bards). A helper with no entry uses its own `goal`, and Bone Chips
+                          -- falls back to factionGoal above, so an older save keeps the goal it had.
+    autoShroud = false,  -- Shroud Strategy (v1.25): a Dark Elf, Troll, Ogre or Iksar under tuning.shroudLevel
+                          -- takes a Goblin Rogue shroud before the courier and Nonad runs. OFF by default since
+                          -- v2.46 (AL: *"we will tackle it in our true form until I see no way around it"*) - the
+                          -- Faction tab can now fix a character's faction, and a shroud blanks the Faction window
+                          -- until a camp. Untickable in Settings. The Faction tab's hidden give shrouds anyway.
 }
+
+-- The default neighborhood, captured from the table above BEFORE loadState can overwrite it - so the
+-- Reset button (v2.30) and the empty-field fallback below both use the one value, and cannot drift.
+ui.defaultNeighborhood = state.neighborhood
 
 -- Persistence
 
@@ -238,8 +255,12 @@ local function loadState()
             if state[k] ~= nil and type(v) == type(state[k]) then state[k] = v end
         end
         -- Lua treats "" as truthy, so an explicitly-saved empty neighborhood survives the merge and
-        -- has to be caught here - old saves without one still want the "Alliance" default.
-        if state.neighborhood == nil or state.neighborhood == "" then state.neighborhood = "Alliance" end
+        -- has to be caught here - old saves without one still want the default.
+        if state.neighborhood == nil or state.neighborhood == "" then state.neighborhood = ui.defaultNeighborhood end
+        -- v2.31: the bare "Alliance" was the OLD default, and it is the setting that landed players in the
+        -- wrong neighborhood (see the default above). Nearly every save file holds it, because the whole
+        -- state is saved whenever anything changes - so upgrade it rather than leave the bug in place.
+        if state.neighborhood == "Alliance" then state.neighborhood = ui.defaultNeighborhood end
         -- A theme that no longer exists (renamed, or hand-edited) falls back rather than leaving the
         -- Settings combo displaying a name nothing matches. croakwatch validates its saved theme the
         -- same way: `if saved.theme and THEMES[saved.theme]`.
@@ -256,16 +277,33 @@ end
 
 -- Detection
 
--- The satchel is Lore + Heirloom - it can sit in the shared bank and a second can still be
--- obtained, so we check inventory AND bank (bank search covers shared-bank slots).
-local function poll()
-    if (mq.TLO.FindItem("=Featherweight Satchel of the Courier").ID() or 0) > 0 then
-        bagLocation = "inventory"
-    elseif (mq.TLO.FindItemBank("=Featherweight Satchel of the Courier").ID() or 0) > 0 then
-        bagLocation = "bank"
-    else
-        bagLocation = nil
+-- How many of an item there are, and where: carried, in THIS character's bank, and in the SHARED bank.
+-- v2.29 fix: the shared bank belongs to the whole ACCOUNT, so an item there may be another character's -
+-- AL's InvSlot Inspector showed a Featherweight Satchel in Genali's shared bank that Genali never earned,
+-- and our own tip tells players to bank one there. FindItemBank and FindItemBankCount both search the
+-- shared bank as well (MQ's CountBankItems walks BankItems then SharedBankItems), so neither can answer
+-- "does THIS character have one" - and both quest rewards were being judged that way. Me.SharedBank[n]
+-- reads the shared slots on their own, bag contents included; the personal bank is whatever the bank count
+-- finds beyond them.
+local function countsOf(name)
+    local shared = 0
+    for n = 1, 10 do   -- past the account's real shared slots, SharedBank returns an empty item
+        local slot = mq.TLO.Me.SharedBank(n)
+        if slot.Name() == name then shared = shared + 1 end
+        for k = 1, (slot.Container() or 0) do
+            if slot.Item(k).Name() == name then shared = shared + 1 end
+        end
     end
+    local banked = (mq.TLO.FindItemBankCount("=" .. name)() or 0) - shared
+    return mq.TLO.FindItemCount("=" .. name)() or 0, math.max(banked, 0), shared
+end
+
+-- The satchel is Lore + Heirloom: a second can be obtained once the first is banked. bagLocation is THIS
+-- character's (carried or personal bank); ui.sharedSatchels is the account's, shown for information only.
+local function poll()
+    local carried, banked, shared = countsOf("Featherweight Satchel of the Courier")
+    bagLocation = (carried > 0 and "inventory") or (banked > 0 and "bank") or nil
+    ui.sharedSatchels = shared
 end
 
 local function deliveredCount()
@@ -307,6 +345,17 @@ function zones.boundAtHub()
     return id == zones.pokId or id == zones.guildLobby
 end
 
+-- Standing in a hub where nothing can attack you? MQ has no native "safe/no-combat zone" flag (AL,
+-- 2026-08-11, confirmed - not guessed), so it is these three. AL: shrouding happens in PoK, and engaging
+-- Sneak immediately afterward meant walking the whole PoK/Guild-Lobby hub portion of travel at Sneak's
+-- reduced speed for zero safety benefit, since those zones are never dangerous.
+-- v2.32: moved up here from near ensureHealed (it was `inSafeHubZone`) so navToNpc's guard watch, which
+-- sits far above that point, can use it too - a Lua local is invisible above its own declaration.
+function zones.inSafeHub()
+    local zid = mq.TLO.Zone.ID() or 0
+    return (mq.TLO.Zone.ShortName() or "") == zones.pokShort or zid == zones.guildLobby or zid == zones.neighborhood
+end
+
 -- Death check shared by both wait helpers below (AL, 2026-08-11: died mid-travel twice in one session -
 -- once the script kept blindly continuing toward a stale destination after a manual respawn, once a wait
 -- just sat out its full timeout instead of noticing death immediately). Me.Hovering() is true only while
@@ -321,7 +370,7 @@ local function diedWhileWaiting()
     return false
 end
 
-local ensureHealed   -- defined near inSafeHubZone (needs waitUntil) - forward-declared here (not just at
+local ensureHealed   -- defined near considerNpc (needs waitUntil) - forward-declared here (not just at
                       -- the usual ensure* block further down) so waitWhileProgressing below can call it
                       -- on every poll, not just once at the top of a travel call. AL, 2026-08-11: arrived
                       -- in PoK at 2% HP mid-multi-hop-journey with no heal check, because the old
@@ -339,6 +388,9 @@ local fleeIfInCombat   -- defined near considerNpc (needs zones.pokShort, justFl
                         -- Sneak alone was never a guarantee - this is the missing "if it's actually
                         -- happening, bail now" safety net for the whole travel engine, not just the
                         -- narrow approach-and-interact window.
+local approachAndInteract   -- defined after radiusWatch/stickBehind - forward-declared so the Nonad and Taxes
+                             -- steps above it can use it too (v2.51: in invis, every NPC is dealt with from
+                             -- behind - AL; they used to walk up to the front and speak).
 local radiusWatch   -- defined near considerNpc/reactionIsSafe (needs considerSpawnId, reactionIsSafe,
                      -- tuning.guardRadius) - forward-declared here so waitUntil/waitWhileProgressing
                      -- below can call it on EVERY poll, same shape as fleeIfInCombat/ensureHealed. AL,
@@ -350,6 +402,33 @@ local radiusWatch   -- defined near considerNpc/reactionIsSafe (needs considerSp
                      -- plain waitUntil (not waitWhileProgressing), and it's exactly the last-mile leg
                      -- where a guard is encountered - both primitives need this, same reasoning as
                      -- fleeIfInCombat above.
+
+-- Run / Pause / Stop for automated runs (v2.29 - the Faction tab's helper quests are the first to use
+-- them). Both wait primitives below check these on EVERY poll, in the same place they already check
+-- `running` for the X button, so a click lands within one poll wherever the run happens to be.
+--   stop   - ends the run the way X does, but leaves the script open. Silent: the user asked for it.
+--   paused - holds the run where it stands until Continue. Paused time is not counted against any wait,
+--            and waitWhileProgressing restarts its stuck clock afterwards - otherwise a long pause reads as
+--            "no progress" and the run gives up the moment the user comes back.
+-- DECLARED ABOVE the wait primitives on purpose: they use it, and a local is only visible below its own
+-- declaration.
+local automation = { stop = false, paused = false,
+    -- v2.38: hold off the automatic shroud. Every travel leg calls ensureShroud, which is right for the
+    -- courier run but wrong while the Faction tab is buying and banking as the character's NORMAL self -
+    -- a shroud cannot reach its own money or bags, so it must come AFTER those steps, not before.
+    noShroud = false,
+    -- v2.50, the flee that carries on (AL): the zone we are in and the one we came from (kept by Radius Watch),
+    -- the zone a flee left, and the NPC the last walk was heading for (a repeat fight is judged by it).
+    zoneNow = nil, zoneFrom = nil, fledFrom = nil, lastNpc = nil,
+    -- v2.51: an NPC interaction is under way - Radius Watch must not put invis back on in the middle of it.
+    interacting = false }
+
+function automation.hold()
+    while automation.paused and running and not automation.stop do
+        ui.drainSpeech()
+        mq.delay(200)
+    end
+end
 
 -- Diagnostic output, off by default, toggled with `/postmaster debug`. Croakwatch's pattern
 -- (`cwDebug` + `/croakwatch debug`).
@@ -381,13 +460,18 @@ end
 local function waitUntil(cond, timeoutMs, stepMs)
     stepMs = stepMs or 200
     local elapsed = 0
+    local fledAtStart = justFledCombat   -- a wait that is PART of a retreat's recovery must not end on it
     while elapsed < timeoutMs do
         if not running then return false end   -- user closed the script mid-wait: abort long travels
+        if automation.paused then automation.hold() end
+        if automation.stop then return false end
         if diedWhileWaiting() then return false end
         ui.drainSpeech()
         if mq.TLO.Me.Shrouded() then
             if fleeIfInCombat() then return false end
             radiusWatch()
+            -- v2.55: Radius Watch can start a retreat itself (invis would not go on) - end the wait, as a flee does.
+            if justFledCombat and not fledAtStart then return false end
         end
         if cond() then return true end
         mq.delay(stepMs)
@@ -412,13 +496,28 @@ local function waitWhileProgressing(cond, stuckAfterMs, ceilingMs, stepMs)
     local lastX, lastY, lastZ = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
     local lastProgressTime = mq.gettime()
     local elapsed = 0
+    local fledAtStart = justFledCombat   -- a wait that is PART of a retreat's recovery must not end on it
     while elapsed < ceilingMs do
         if not running then return false end
+        if automation.paused then
+            automation.hold()
+            lastX, lastY, lastZ = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
+            lastProgressTime = mq.gettime()
+        end
+        if automation.stop then return false end
         if diedWhileWaiting() then return false end
         ui.drainSpeech()
         if mq.TLO.Me.Shrouded() then
             if fleeIfInCombat() then return false end
+            local watchStart = mq.gettime()
             radiusWatch()
+            -- v2.55: Radius Watch can start a retreat itself (invis would not go on) - end the wait, as a flee does.
+            if justFledCombat and not fledAtStart then return false end
+            -- ...and standing still to hide is not a stall: restart the no-progress clock after a long stop.
+            if mq.gettime() - watchStart > 1000 then
+                lastX, lastY, lastZ = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
+                lastProgressTime = mq.gettime()
+            end
         end
         if cond() then return true end
         -- Heal-in-PoK check on every poll, not just once at the top of a travel call (AL, 2026-08-11) -
@@ -540,7 +639,7 @@ end
 -- direct wait-timeout prints only, where the user is most likely to be waiting mid-run - the return value
 -- (and whatever it unwinds into) still happens either way, this only silences the misleading console line.
 local function printIfRunning(msg)
-    if running then print(msg) end
+    if running and not automation.stop then print(msg) end   -- a Stop click is the same case as X
 end
 
 -- A clickable EQ item link for console output - the purple links you can click to open the real item
@@ -572,6 +671,8 @@ local gateIsReady     -- the "can we Gate right now" test, in ONE place. It was 
                        -- twice already and the two copies were the seed of this bug class.
 local checkBind       -- defined near tryGate; reports a bind Gate cannot use. NEVER changes the bind
 local bindNoted = false   -- checkBind speaks once per run, not on every trip home
+local shroudTooLowNoted = false   -- ensureShroud says "too low to shroud" once per run, not on every trip
+local invisMissingZone = nil   -- zone id where "no invis available" was last said: once per zone (v2.32)
 local ensureMovementBuff   -- defined near navToNpc (needs printIfRunning, item/spell/AA data tables)
 local ensureShroud   -- defined near getGoblinRogueShroud (needs navToNpc, zones.pokShort, waitWhileProgressing)
 -- ensureHealed forward-declared earlier (right before waitUntil/waitWhileProgressing), not here - it
@@ -593,8 +694,9 @@ local function travelToSunriseHills()
                              -- /travelto too (2026-08-09), not only during the final NPC approach.
     checkBind()   -- says so once if the bind is somewhere Gate cannot use. Reports only - the Gate tiers
                    -- make their own live bind check at the moment they fire.
-    ensureShroud()   -- evil race + under tuning.shroudLevel gets a Goblin Rogue Shroud from the start -
-                      -- same single-early-hook shape as the two calls above.
+    ensureShroud()   -- evil race + under tuning.shroudLevel gets a Goblin Rogue Shroud from the start, if
+                      -- Settings asks for it (state.autoShroud, off since v2.46) - same single-early-hook
+                      -- shape as the two calls above.
     ensureHealed()   -- AL, 2026-08-11: arrived in PoK hurt after escaping Erudin, then died to the Halas
                       -- zone-in guards partly for having gone in already hurt - free, risk-free recovery
                       -- since combat can't happen in a safe hub zone anyway.
@@ -682,15 +784,44 @@ local function travelToSunriseHills()
         return
     end
 
-    -- 3. SearchType index 3 = "neighborhood"; search the saved name, enter the first match
+    -- 3. SearchType index 3 = "neighborhood"; search the saved name, then enter the row whose NAME matches
+    -- it exactly. v2.31: this used to take row 1 whatever it was, and the search matches any part of a
+    -- name - "Alliance" also returns guild and player neighborhoods, one of which could be row 1. Column 1
+    -- of RENW_NeighborhoodList is the neighborhood name (the game's own EQUI_RealEstateNeighborhoodWnd.xml).
     mq.cmd('/notify RealEstateNeighborhoodWnd RENW_SearchType_Combobox listselect 3')
     mq.delay(800)
     mq.TLO.Window('RealEstateNeighborhoodWnd/RENW_Search_EditBox').SetText(state.neighborhood)()
     mq.delay(600)
     mq.cmd('/notify RealEstateNeighborhoodWnd RENW_Search_Button leftmouseup')
+    local results = mq.TLO.Window('RealEstateNeighborhoodWnd/RENW_NeighborhoodList')
+    -- v2.47: the SERVER answers the search, and until it does the list still holds what the window opened
+    -- with. 2.31-2.46 read the row the instant Search was pressed, so it could find the name in that OLD
+    -- list; by the time listselect ran the results had replaced it, the row pointed at nothing, nothing was
+    -- selected and Go did nothing (AL, Xanley, 2.46 - the first field run of the 2.31 change). So: the 1.5 s
+    -- wait the pre-2.31 code always had, then only a row that reads the SAME on two polls in a row.
     mq.delay(1500)
-    mq.cmd('/notify RealEstateNeighborhoodWnd RENW_NeighborhoodList listselect 1')
-    mq.delay(600)
+    local row, last = 0, -1
+    waitUntil(function()
+        row = results.List('=' .. state.neighborhood, 1)() or 0
+        local steady = row > 0 and row == last
+        last = row
+        return steady
+    end, 5000, 500)
+    if row == 0 then
+        -- No exact match (a partial name typed, or a spelling off): take the first result as before, but
+        -- SAY which one, so a wrong neighborhood is never a silent surprise.
+        row = 1
+        print(string.format('\ay[Postmaster]\ax no neighborhood named exactly "%s" - entering the first result, "%s".',
+            state.neighborhood, results.List(1, 1)() or "?"))
+    end
+    -- Select, and CHECK it took before pressing Go - Go with nothing selected does nothing at all.
+    for _ = 1, 2 do
+        mq.cmdf('/notify RealEstateNeighborhoodWnd RENW_NeighborhoodList listselect %d', row)
+        mq.delay(600)
+        if (results.SelectedIndex() or 0) == row then break end
+    end
+    dbg(string.format('neighborhood: row %d of %d, selected %d, "%s"', row, results.Items() or 0,
+        results.SelectedIndex() or 0, tostring(results.List(row, 1)())))
     mq.cmd('/notify RealEstateNeighborhoodWnd RENW_Go_Button leftmouseup')
 
     -- 4. Confirm arrival
@@ -1399,7 +1530,13 @@ local function ensureInvisBuff()
         mq.delay(1000)
         if mq.TLO.Me.Invis(1)() then return true end
     end
-    printIfRunning('\ay[Postmaster]\ax no invis available - crossing near a guard without one, KOS risk.')
+    -- ONCE per zone (v2.32). navToNpc's guard watch calls this on every poll of a walk while a guard is
+    -- near, so with nothing to cast it printed the same line 28 times in one walk (AL, level 1 Iksar).
+    -- The finding does not change mid-zone; saying it once is the whole of its value.
+    if invisMissingZone ~= mq.TLO.Zone.ID() then
+        invisMissingZone = mq.TLO.Zone.ID()
+        printIfRunning('\ay[Postmaster]\ax no invis available - crossing near a guard without one, KOS risk.')
+    end
     return false
 end
 
@@ -1430,6 +1567,7 @@ local function guardNearby()
 end
 
 local function navToNpc(name)
+    automation.lastNpc = name   -- a fight near this NPC counts as "at" it (retryStep's repeat-fight wait)
     local id = mq.TLO.Spawn("npc " .. name).ID() or 0
     if id == 0 then
         print('\ar[Postmaster]\ax NPC not found nearby: ' .. name)
@@ -1438,7 +1576,9 @@ local function navToNpc(name)
     local watchErudinGem = (mq.TLO.Zone.ShortName() or "") == "erudnext"
     -- Movement: unconditional, for everyone (see ensureMovementBuff's own comment). Invis/guard-watch:
     -- only for factionRisk characters below the level where guard aggro stops mattering.
-    local watchGuards = factionRisk and (mq.TLO.Me.Level() or 0) < tuning.factionRiskLevel
+    -- Not in a safe hub (v2.32): the Guild Lobby has NPCs with "guard" in the name, so a level 1 Iksar
+    -- walking to its reagent vendor tripped the watch on every poll, where nothing can attack at all.
+    local watchGuards = factionRisk and (mq.TLO.Me.Level() or 0) < tuning.factionRiskLevel and not zones.inSafeHub()
     local function farFrom(range) return (mq.TLO.Spawn("id " .. id).Distance3D() or 999) > range end
     -- The player closes the last bit by hand and we carry on the moment they are within `range`.
     local function waitForPlayer(range)
@@ -1513,7 +1653,8 @@ local function navToNpc(name)
     -- 180s covers a long run across a huge zone (e.g. West Karana zone-in -> the fishing village).
     local pinned, ended = walk(180000)
     if not ended then
-        printIfRunning('\ar[Postmaster]\ax nav to ' .. name .. ' timed out.')
+        -- A walk broken off by the combat flee did not "time out" - the flee has already said what happened.
+        if not justFledCombat then printIfRunning('\ar[Postmaster]\ax nav to ' .. name .. ' timed out.') end
         return false
     end
     -- Nav reports "done" even when it never found a path (mesh gap - e.g. the Kelethin lifts leave the
@@ -1573,10 +1714,12 @@ end
 -- itself is shared across the whole family ("/CWTN pause on/off"), just need to know if ANY is loaded
 -- for this class first (pattern adapted from pppoker's cwtnPluginNamesForClass - AL: "we have worked on
 -- CWTN/RGMercs/KA before to pause them on other scripts").
+-- SHD's plugin is MQ2EsKay - it reads as "S.K." - and no MQ2ShadowKnight.dll exists, so the old
+-- spelling left IsLoaded() always false and a Shadowknight was never actually paused.
 local CWTN_PLUGIN_NAMES = {
     BRD = "MQ2Bard", BST = "MQ2Bst", BER = "MQ2Berserker", CLR = "MQ2Cleric", DRU = "MQ2Druid",
     ENC = "MQ2Enchanter", MAG = "MQ2Mage", MNK = "MQ2Monk", NEC = "MQ2Necro", PAL = "MQ2Paladin",
-    RNG = "MQ2Ranger", ROG = "MQ2Rogue", SHD = "MQ2ShadowKnight", SHM = "MQ2Shaman",
+    RNG = "MQ2Ranger", ROG = "MQ2Rogue", SHD = "MQ2EsKay", SHM = "MQ2Shaman",
     WAR = "MQ2Warrior", WIZ = "MQ2Wizard",
 }
 
@@ -1586,16 +1729,27 @@ local function cwtnPaused()
     return nil
 end
 
--- Pauses the character's CWTN plugin if one is loaded and not already paused. Returns true only if
--- THIS call paused it, so the caller knows to unpause afterward - never touches a pause the user set
--- themselves. Deliberately narrow (just around one retry attempt, not the whole run) - the High Keep
--- gnoll pack is a real death risk during travel, so CWTN stays active everywhere else for auto-defense.
+-- Pauses the character's own CWTN plugin if one is loaded and not already paused. Returns the class
+-- short name - which is the plugin's command prefix - when THIS call paused it, so the caller can
+-- unpause the same way. Never touches a pause the user set themselves. Deliberately narrow (just
+-- around one retry attempt, not the whole run) - the High Keep gnoll pack is a real death risk
+-- during travel, so CWTN stays active everywhere else for auto-defense.
+-- The command is "/<class short name> pause on", NOT "/CWTN pause on". The CWTN plugins install
+-- "/cwtn" as an ALIAS for "/dgge /docommand /${Me.Class.ShortName}", written into the [Aliases]
+-- section of MacroQuest.ini when the plugin loads, and /dgge is DanNet group execute EXCLUDING
+-- yourself. So the old spelling paused every box in the group except the one whose casting was
+-- interrupting the give window, and did nothing at all for a character running solo. The plugin's
+-- own pause button sends "/<short> pause on", and so does this.
+-- nosave: without it the plugin writes "pause=on" into [General] of its per-character config, so a
+-- run that ends before the unpause leaves the character starting paused in a later session with
+-- nothing on screen to say why.
 local function pauseCwtnIfLoaded()
-    local pluginName = CWTN_PLUGIN_NAMES[(mq.TLO.Me.Class.ShortName() or ""):upper()]
+    local short = (mq.TLO.Me.Class.ShortName() or ""):upper()
+    local pluginName = CWTN_PLUGIN_NAMES[short]
     if not pluginName or not mq.TLO.Plugin(pluginName).IsLoaded() then return false end
     if cwtnPaused() == true then return false end
-    mq.cmd('/CWTN pause on')
-    return true
+    mq.cmdf('/%s pause on nosave', short)
+    return short
 end
 
 -- Opens the give/trade window after an item is already on the cursor and the NPC is targeted. Retries
@@ -1603,11 +1757,12 @@ end
 -- run gave 3 clean successes in a row via this identical sequence, then failed once with "give window
 -- did not open" - matches a CWTN class plugin (MQ2Mage/MQ2War/MQ2Necro/etc) interrupting the click with
 -- a cast at a bad moment, not a logic bug in the give sequence itself.
--- Also drops/reapplies invis around the click (covers giveItem/giveItemById/giveItems automatically,
+-- Also drops/reapplies invis around the click (covers giveItem/giveItemsById/giveItems automatically,
 -- one shared touch point instead of three) - opening the window needs the NPC to notice you, same as
--- a hail/say.
-local function openGiveWindow()
-    local droppedInvis = dropInvisForInteraction()
+-- a hail/say. EXCEPT with `keepHidden` (v2.37): a hidden trade to a hostile NPC must not /makemevisible -
+-- Hide very likely counts as invisibility here, and dropping it is what gets the character attacked.
+local function openGiveWindow(keepHidden)
+    local droppedInvis = not keepHidden and dropInvisForInteraction()
     mq.cmd('/click left target')
     local opened
     if waitUntil(function()
@@ -1615,21 +1770,22 @@ local function openGiveWindow()
     end, 5000) then
         opened = true
     else
-        local pausedIt = pauseCwtnIfLoaded()
-        dbg('give window did not open - retrying' .. (pausedIt and ' with CWTN paused' or '') .. '...')
+        local pausedCwtn = pauseCwtnIfLoaded()
+        dbg('give window did not open - retrying' .. (pausedCwtn and ' with CWTN paused' or '') .. '...')
         mq.cmd('/click left target')
         opened = waitUntil(function()
             return mq.TLO.Window("GiveWnd").Open() or mq.TLO.Window("TradeWnd").Open()
         end, 5000)
-        if pausedIt then mq.cmd('/CWTN pause off') end
+        if pausedCwtn then mq.cmdf('/%s pause off nosave', pausedCwtn) end
     end
     if droppedInvis then ensureInvisBuff() end
     return opened
 end
 
 -- Hand an inventory item to a targeted NPC. NPC hand-ins open GiveWnd (GVW_Give_Button);
--- TradeWnd is a fallback. Window/child names to be confirmed in-field.
-local function giveItem(itemName, npcName)
+-- TradeWnd is a fallback. Window/child names to be confirmed in-field. `keepHidden` passes through to
+-- openGiveWindow (v2.37 - the hidden trade, see approachAndInteract).
+local function giveItem(itemName, npcName, keepHidden)
     local id = mq.TLO.Spawn("npc " .. npcName).ID() or 0
     if id == 0 then
         print('\ar[Postmaster]\ax cannot give to (not found): ' .. npcName)
@@ -1643,7 +1799,7 @@ local function giveItem(itemName, npcName)
         print('\ar[Postmaster]\ax could not pick up ' .. itemName)
         return false
     end
-    if not openGiveWindow() then
+    if not openGiveWindow(keepHidden) then
         print('\ar[Postmaster]\ax give window did not open')
         if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
         return false
@@ -1660,61 +1816,78 @@ local function giveItem(itemName, npcName)
     return true
 end
 
--- Same give sequence as giveItem, but targets an EXACT item by id instead of by name - needed once
--- multiple identically-named-but-distinct items (e.g. postal letters, confirmed 2026-08-05 by AL:
--- same display name, different item IDs) can be held at once. Picks up by inventory slot instead of
--- name: field-confirmed (AL) ItemSlot2 == -1 means the item sits directly in a top-level bag slot
--- (bare "/itemnotify <ItemSlot>"); ItemSlot2 >= 0 means it's inside a sub-container at that sub-slot,
--- using the standard MQ "packN" convention (packN = ItemSlot - 22, matching the main bag slots being
--- 23-32) - NOT independently field-verified for this exact case, so the Cursor.ID() check right after
--- is a hard safety net: if the slot math is ever wrong, this fails loudly instead of grabbing/giving
--- the wrong item silently.
-local function giveItemById(itemId, npcName)
+-- Picking up by EXACT item id, not name (was giveItemById, one item a trade, until v2.54): identically named but
+-- distinct items (postal letters - confirmed 2026-08-05 by AL: same display name, different item IDs) can be held
+-- at once. By inventory slot: field-confirmed (AL) ItemSlot2 == -1 means the item sits directly in a top-level
+-- bag slot (bare "/itemnotify <ItemSlot>"); ItemSlot2 >= 0 means it is inside a sub-container at that sub-slot,
+-- MQ's "packN" convention (packN = ItemSlot - 22, the main bag slots being 23-32). The Cursor.ID() check after
+-- each pickup is the hard safety net: if the slot math is ever wrong, it fails loudly, never gives the wrong item.
+-- Several EXACT items (by item id - letters that share a name, e.g. four "Bardic Letter (Qeynos)") to one NPC in
+-- ONE trade, up to the give window's four slots (v2.54). Each is picked up by its own inventory slot (above) and
+-- must leave the cursor into its give slot before the next is picked up - the slot filling is giveItems'
+-- field-proven GVW_MyItemSlotN sequence. Returns true once Give was pressed; the caller judges each item by its own
+-- id leaving the bags.
+local function giveItemsById(ids, npcName, keepHidden)
     local npcSpawnId = mq.TLO.Spawn("npc " .. npcName).ID() or 0
     if npcSpawnId == 0 then
         print('\ar[Postmaster]\ax cannot give to (not found): ' .. npcName)
         return false
     end
-    local item = mq.TLO.FindItem(itemId)
-    if (item.ID() or 0) == 0 then
-        print('\ar[Postmaster]\ax item id ' .. tostring(itemId) .. ' not found in inventory')
-        return false
-    end
-    local slot1, slot2 = item.ItemSlot(), item.ItemSlot2()
     mq.cmdf('/target id %d', npcSpawnId)
     mq.delay(300)
-    if slot2 and slot2 >= 0 then
-        mq.cmdf('/shift /itemnotify in pack%d %d leftmouseup', slot1 - 22, slot2 + 1)
-    else
-        mq.cmdf('/shift /itemnotify %d leftmouseup', slot1)
-    end
-    mq.delay(600)
-    if (mq.TLO.Cursor.ID() or 0) ~= itemId then
-        print('\ar[Postmaster]\ax could not pick up the correct item (id ' .. tostring(itemId) .. ', got '
-            .. tostring(mq.TLO.Cursor.ID()) .. ') - slot math may be wrong for that item location.')
+    local function abandon()
+        if mq.TLO.Window("GiveWnd").Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+        mq.delay(500)
         if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
         return false
     end
-    if not openGiveWindow() then
-        print('\ar[Postmaster]\ax give window did not open')
-        if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
-        return false
+    local placed = 0
+    for _, itemId in ipairs(ids) do
+        if placed >= 4 then break end
+        local item = mq.TLO.FindItem(itemId)
+        if (item.ID() or 0) > 0 then
+            local slot1, slot2 = item.ItemSlot(), item.ItemSlot2()
+            if slot2 and slot2 >= 0 then
+                mq.cmdf('/shift /itemnotify in pack%d %d leftmouseup', slot1 - 22, slot2 + 1)
+            else
+                mq.cmdf('/shift /itemnotify %d leftmouseup', slot1)
+            end
+            mq.delay(600)
+            if (mq.TLO.Cursor.ID() or 0) ~= itemId then
+                print('\ar[Postmaster]\ax could not pick up the correct item (id ' .. tostring(itemId) .. ', got '
+                    .. tostring(mq.TLO.Cursor.ID()) .. ') - cancelling the trade.')
+                return abandon()
+            end
+            if placed == 0 then
+                if not openGiveWindow(keepHidden) then
+                    print('\ar[Postmaster]\ax give window did not open')
+                    return abandon()
+                end
+            else
+                mq.cmdf('/notify GiveWnd GVW_MyItemSlot%d leftmouseup', placed)
+            end
+            if not waitUntil(function() return (mq.TLO.Cursor.ID() or 0) == 0 end, 2000, 100) then
+                print('\ar[Postmaster]\ax item ' .. tostring(itemId) .. ' did not go into the give window - cancelling the trade.')
+                return abandon()
+            end
+            placed = placed + 1
+            mq.delay(200)
+        end
     end
-    mq.delay(500)
-    if mq.TLO.Window("GiveWnd").Open() then
-        mq.cmd('/notify GiveWnd GVW_Give_Button leftmouseup')
-    else
-        mq.cmd('/nomodkey /itemnotify trade leftmouseup')
-        mq.delay(300)
-        mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
-    end
+    if placed == 0 or not mq.TLO.Window("GiveWnd").Open() then return abandon() end
+    mq.cmd('/notify GiveWnd GVW_Give_Button leftmouseup')
     mq.delay(1000)
     return true
 end
 
--- Hand MULTIPLE items to a targeted NPC in one give window (e.g. Full box + List of Debtors).
--- GVW_MyItemSlotN placement for items 2+ is a best guess - verify in-field.
-local function giveItems(itemNames, npcName)
+-- Hand MULTIPLE items to a targeted NPC in one give window (e.g. Full box + List of Debtors) - the window
+-- has four slots, GVW_MyItemSlot0-3 (the game's EQUI_GiveWnd.xml). Proven in the field on Vicus's two items.
+-- The same name may be listed more than once, to hand over several stacks: MQ's name lookup searches the
+-- cursor and the bags only, so a stack already in the give window is not found again - the next pickup by
+-- name takes the NEXT stack (MQ2Utilities.cpp, FindItemByName). `keepHidden` as in giveItem (v2.43).
+-- v2.43: each item must actually LEAVE the cursor into its slot before the next is picked up - a pickup by
+-- name looks at the cursor first, so a stack left there would be picked "again" and the window would jam.
+local function giveItems(itemNames, npcName, keepHidden)
     local id = mq.TLO.Spawn("npc " .. npcName).ID() or 0
     if id == 0 then
         print('\ar[Postmaster]\ax cannot give to (not found): ' .. npcName)
@@ -1733,7 +1906,7 @@ local function giveItems(itemNames, npcName)
                 return false
             end
             if placed == 0 then
-                if not openGiveWindow() then
+                if not openGiveWindow(keepHidden) then
                     print('\ar[Postmaster]\ax give window did not open')
                     if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
                     return false
@@ -1741,8 +1914,15 @@ local function giveItems(itemNames, npcName)
             else
                 mq.cmdf('/notify GiveWnd GVW_MyItemSlot%d leftmouseup', placed)   -- next give slot
             end
+            if not waitUntil(function() return (mq.TLO.Cursor.ID() or 0) == 0 end, 2000, 100) then
+                print('\ar[Postmaster]\ax ' .. itemName .. ' did not go into the give window - cancelling the trade.')
+                if mq.TLO.Window("GiveWnd").Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+                mq.delay(500)
+                if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
+                return false
+            end
             placed = placed + 1
-            mq.delay(500)
+            mq.delay(200)
         end
     end
     if placed == 0 then
@@ -1893,10 +2073,26 @@ end
 
 -- Gate condition for the whole Shroud Strategy - evil race AND below tuning.shroudLevel (reasoning
 -- at tuning.shroudLevel) - same "run once early" hook as ensureMovementBuff/checkBind above.
-ensureShroud = function()
+-- `force` (v2.46): the Faction tab's hidden give needs the shroud whatever the Settings box says - it is the
+-- only way to hand a hostile NPC anything. Every other caller respects state.autoShroud.
+ensureShroud = function(force)
     if not factionRisk then return true end
+    if not force and not state.autoShroud then return true end
+    if automation.noShroud then return true end   -- the Faction tab is buying/banking as yourself first
     if (mq.TLO.Me.Level() or 0) >= tuning.shroudLevel then return true end
     if mq.TLO.Me.Shrouded() then return true end
+    -- v2.29: the shroud tiers start at level 5 (see getGoblinRogueShroud), so a level 1-4 character has
+    -- nothing to pick. Before this check it tried anyway on EVERY trip between zones - a detour to PoK, a
+    -- hail, "level 0 not found" - and then travelled on unshrouded regardless. Found building the Faction
+    -- tab, for a brand-new level 1 Iksar test character.
+    if (mq.TLO.Me.Level() or 0) < 5 then
+        if not shroudTooLowNoted then
+            shroudTooLowNoted = true
+            print('\ay[Postmaster]\ax level ' .. (mq.TLO.Me.Level() or 0) .. ' is too low for a Goblin Rogue shroud'
+                .. ' (they start at level 5) - travelling as yourself, with no stealth protection.')
+        end
+        return true
+    end
     return getGoblinRogueShroud()
 end
 
@@ -2102,8 +2298,13 @@ local function travelToZone(traveltoArg, anchorNpc)
             end, 20000, 300000)
             if arrived then return true end
         end
+        -- v2.50: a combat flee's own /easyfind is running now - stopping "travel" would cancel THAT.
+        if justFledCombat then return false end
         mq.cmd('/easyfind stop')
         mq.cmd('/travelto stop')
+        -- A Stop click fails every wait at once - it must end the trip here, never fall through into the
+        -- PoK fallback below, which starts by trying Gate.
+        if automation.stop then return false end
         dbg('via ' .. viaDirect .. ' to ' .. traveltoArg .. ' didn\'t pan out - falling back to Plane of Knowledge.')
     end
 
@@ -2136,6 +2337,8 @@ local function travelToZone(traveltoArg, anchorNpc)
             return (mq.TLO.Spawn("npc " .. anchorNpc).ID() or 0) > 0
         end, 20000, 300000)
         if arrived then return true end
+        -- v2.50: a combat flee took over - retryStep brings us back; no stall fallback (it starts with Gate).
+        if justFledCombat then return false end
         -- v1.50: don't stop travel if the wait aborted because fleeIfInCombat() just fired - that call
         -- already issued its OWN /travelto zones.pokShort a moment earlier, and stopping "travel" here
         -- actually cancels THAT in-flight flee, not the original (already-abandoned) direct attempt.
@@ -2145,6 +2348,7 @@ local function travelToZone(traveltoArg, anchorNpc)
         if not justFledCombat then
             mq.cmd('/travelto stop')
         end
+        if automation.stop then return false end   -- the user's Stop, not a stall: no Gate, no PoK fallback
         dbg('direct travel to ' .. traveltoArg .. ' stalled - routing via Plane of Knowledge instead.')
     end
 
@@ -2173,6 +2377,7 @@ local function travelToZone(traveltoArg, anchorNpc)
             if watchHalasExit then halasExitWatch() end
             return (mq.TLO.Zone.ShortName() or "") == zones.pokShort
         end, 20000, 300000) then
+            if justFledCombat then return false end   -- v2.50: the flee took over; retryStep brings us back
             printIfRunning('\ar[Postmaster]\ax could not reach PoK - travel manually, then run again.')
             return false
         end
@@ -2189,6 +2394,7 @@ local function travelToZone(traveltoArg, anchorNpc)
     if via then
         mq.cmd('/travelto ' .. via)
         if not waitUntil(function() return (mq.TLO.Zone.ShortName() or "") == via end, 180000, 2000) then
+            if justFledCombat then return false end   -- v2.50: the flee took over; retryStep brings us back
             printIfRunning('\ar[Postmaster]\ax could not reach ' .. via .. ' (on the way to ' .. traveltoArg .. ') - travel manually.')
             return false
         end
@@ -2200,6 +2406,7 @@ local function travelToZone(traveltoArg, anchorNpc)
     if not waitUntil(function()
         return (mq.TLO.Spawn("npc " .. anchorNpc).ID() or 0) > 0
     end, 240000, 2000) then
+        if justFledCombat then return false end   -- v2.50: the flee took over; retryStep brings us back
         printIfRunning('\ar[Postmaster]\ax did not reach ' .. anchorNpc .. ' via /travelto ' .. traveltoArg .. ' - travel manually, then run again.')
         return false
     end
@@ -2350,12 +2557,15 @@ local function giveTonic()
     if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
-    if not giveItem(items.tonic, nonad.vicus) then nonadBusy = false; return false end
-    mq.delay(1000)
-    local ok = requestTaxBoxFromVicus()
+    -- The tonic goes over, then a say asks for the box. Vicus faces us (faceOk, v2.56): the quest only reaches him
+    -- once Antonius Bayle is at least Apprehensive, so he never attacks.
+    local ok = approachAndInteract(nonad.vicus, function()
+        if not giveItem(items.tonic, nonad.vicus) then return false end
+        mq.delay(1000)
+        return requestTaxBoxFromVicus()
+    end, nil, true)
     nonadBusy = false
-    return ok
+    return ok == true
 end
 
 -- Manual shortcut (AL's "Go to Vicus" button, 2026-08-14) - skips the tonic entirely, straight to asking
@@ -2367,10 +2577,9 @@ local function getTaxBoxDirect()
     if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
-    local ok = requestTaxBoxFromVicus()
+    local ok = approachAndInteract(nonad.vicus, requestTaxBoxFromVicus, nil, true)   -- faces Vicus (v2.56)
     nonadBusy = false
-    return ok
+    return ok == true
 end
 
 -- COLLECT_TAXES: for each merchant, say "tax collection", take the tax coin off the cursor and
@@ -2451,11 +2660,13 @@ local function collectViaFlynn()
         print('\ar[Postmaster]\ax ' .. tax.flynn .. ' not found - verify name / zone shortname.')
         return false
     end
-    if not navToNpc(tax.flynn) then return false end
-    sayPhrase(tax.flynn, tax.flynnPhrase)
-    if waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
-        return putCursorInBox()
-    end
+    -- v2.51: from behind when in invis (AL) - through approachAndInteract.
+    local got = approachAndInteract(tax.flynn, function()
+        sayPhrase(tax.flynn, tax.flynnPhrase)
+        return waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000)
+    end)
+    if got == nil then return false end   -- could not reach him - already said
+    if got then return putCursorInBox() end
     print('\ar[Postmaster]\ax no tax from ' .. tax.flynn .. ' - verify the exact phrase.')
     return false
 end
@@ -2501,7 +2712,10 @@ local function collectTaxes()
     end
 
     for _, m in ipairs(tax.merchants) do
-        if not running then break end
+        -- v2.49: stop the moment the flee fires. Before, a tax landed, the room attacked, the flee set off
+        -- for PoK - and this loop walked on to the NEXT merchant, whose /nav overrode the flee's /travelto.
+        -- The flee fires only once, so nothing sent him away again (AL, a shrouded Xanley, died at Fish).
+        if not running or justFledCombat then break end
         if not state.taxes[m] then
             if m == tax.mira then
                 -- Mira is skipped - collect Sayer's tax straight from Flynn (North Qeynos)
@@ -2519,9 +2733,14 @@ local function collectTaxes()
                 end
                 if (mq.TLO.Spawn("npc " .. m).ID() or 0) == 0 then
                     print('\ay[Postmaster]\ax merchant not found: ' .. m .. ' (verify name / zone shortname)')
-                elseif navToNpc(m) then
-                    sayPhrase(m, tax.phrase)
-                    if waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
+                else
+                    -- v2.51: through approachAndInteract, so in invis it comes from BEHIND the merchant (AL).
+                    -- Nil = could not reach or approach (already said); false = reached, but no tax came.
+                    local got = approachAndInteract(m, function()
+                        sayPhrase(m, tax.phrase)
+                        return waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000)
+                    end)
+                    if got then
                         if putCursorInBox() then
                             state.taxes[m] = true
                             saveState()
@@ -2529,7 +2748,7 @@ local function collectTaxes()
                         else
                             print('\ar[Postmaster]\ax could not box the tax from ' .. m .. ' - check box slot / cursor.')
                         end
-                    else
+                    elseif got == false and not justFledCombat then
                         print('\ay[Postmaster]\ax no tax received from ' .. m .. ' - verify phrase / faction.')
                     end
                 end
@@ -2537,6 +2756,12 @@ local function collectTaxes()
         end
     end
 
+    if justFledCombat then
+        print(string.format('\ay[Postmaster]\ax attacked while collecting taxes (%d/%d boxed) - getting clear, then'
+            .. ' carrying on with the rest.', taxCount(), #tax.merchants))
+        nonadBusy = false
+        return false
+    end
     local n = taxCount()
     if n >= #tax.merchants then
         print('\ag[Postmaster]\ax all ' .. n .. ' taxes boxed - combining...')
@@ -2566,8 +2791,11 @@ local function returnToVicus()
     if (mq.TLO.Spawn("npc " .. nonad.vicus).ID() or 0) == 0 then
         if not travelToQeynos() then nonadBusy = false; return false end
     end
-    if not navToNpc(nonad.vicus) then nonadBusy = false; return false end
-    if not giveItems({ items.fullbox, items.list }, nonad.vicus) then
+    -- HIDDEN through it - a hand-over needs no visibility (v2.37) - and facing Vicus (faceOk, v2.56: he never attacks
+    -- by the time the quest reaches him, and his kneeling pose made the behind maneuver hard - AL).
+    if not approachAndInteract(nonad.vicus, function()
+        return giveItems({ items.fullbox, items.list }, nonad.vicus, true)
+    end, true, true) then
         nonadBusy = false
         return false
     end
@@ -2629,10 +2857,13 @@ end
 -- placeable (house/yard/guild) - once placed it's hidden from find, so this only catches a still-held
 -- figure. That's fine: its only job is to flip the PERSISTED nonadDone once; persistence is the real
 -- permanent flag and survives placing the figure later.
+-- v2.29: this character's inventory and PERSONAL bank only. A figure in the account-wide shared bank may
+-- be another character's, and counting it would persist a false nonadDone - after which Lysric withholds
+-- the satchel for a quest the script says is finished. (See countsOf for how the two banks are told apart.)
 local function detectNonadReward()
     if state.nonadDone then return end
-    if (mq.TLO.FindItem("=" .. nonad.reward).ID() or 0) > 0
-        or (mq.TLO.FindItemBank("=" .. nonad.reward).ID() or 0) > 0 then
+    local carried, banked = countsOf(nonad.reward)
+    if carried + banked > 0 then
         state.nonadDone = true
         saveState()
         print('\ag[Postmaster]\ax Nonad reward figure detected - The Nonad Brothers marked complete.')
@@ -2648,7 +2879,9 @@ end
 -- 3 seconds), so this fails fast and reports clearly rather than looping.
 local function retryStep(label, fn, ...)
     local args = { ... }
-    for attempt = 1, 2 do
+    -- A flee's return trip is not a failed attempt, so `attempt` only counts genuine failures (v2.50).
+    local attempt, flees, fleeTotal = 1, {}, 0
+    while attempt <= 2 do
         justFledCombat = false
         local ok = fn(unpack(args))   -- LuaJIT/5.1 global unpack, NOT table.unpack (that's 5.2+)
         if ok then return true end
@@ -2661,8 +2894,8 @@ local function retryStep(label, fn, ...)
         --    so an abort is indistinguishable from a failure at this level. Without this check, clicking
         --    X mid-run printed "failed - retrying once", burned 3s, printed "failed twice", and fired
         --    alert.wav at somebody who had just closed the window. Closing a script must be SILENT -
-        --    no print, no chime, no speech.
-        if not running then return false end
+        --    no print, no chime, no speech. A Stop click (v2.29) is the same thing.
+        if not running or automation.stop then return false end
 
         -- 2. THE CHARACTER DIED. `diedWhileWaiting()` has already said so. The step cannot possibly
         --    succeed until a human clicks respawn, so retrying 3s later is guaranteed to fail and only
@@ -2672,19 +2905,35 @@ local function retryStep(label, fn, ...)
             return false
         end
 
-        -- 3. A genuine failure - fall through to the retry below.
-        -- Don't blindly retry straight back at an NPC we just fled from - AL, 2026-08-11 field test:
-        -- the automatic retry ran right back at an already-hostile, already-attacking Ticar and ended up
-        -- circling him while getting hit. A normal failure (bad reading, couldn't reach, etc.) is safe
-        -- to retry since the step functions re-check reality each time; fleeing active combat is not the
-        -- same kind of failure and needs a person to look at it first.
+        -- 3. A FLEE - carry on (v2.50, AL: *"carry on automatically after a flee, skip what's done"*).
+        -- Until 2.49 this stopped: in August the automatic retry ran straight back at an already-attacking
+        -- Ticar and circled him while getting hit. The answer now is the zone line in between - crossing it
+        -- drops the aggro - then a wait and stealth re-armed before going back in (recoverFromFlee). A fight
+        -- near the same NPC again waits 30 s instead of 10 (AL); a sixth flee in one step stops the run, so a
+        -- spot that attacks every time cannot loop flee-return-flee for ever with nobody watching.
         if justFledCombat then
-            print('\ar[Postmaster]\ax ' .. label .. ' failed after fleeing combat - stopping without retrying. Make sure you are clear, then run again.')
-            return false
-        end
-        if attempt < 2 then
-            print('\ay[Postmaster]\ax ' .. label .. ' failed - retrying once...')
-            mq.delay(3000)
+            local npc = automation.lastNpc or ""
+            flees[npc] = (flees[npc] or 0) + 1
+            fleeTotal = fleeTotal + 1
+            if fleeTotal > 5 then
+                ui.announce("alert.wav", label .. " keeps drawing fights.<silence msec='250'/> Postmaster has stopped.", true)
+                print('\ar[Postmaster]\ax ' .. label .. ' drew a fight 5 times - stopping. Something here attacks'
+                    .. ' every time; take a look, then run again.')
+                return false
+            end
+            if not automation.recoverFromFlee(flees[npc] > 1) then
+                if mq.TLO.Me.Hovering() then
+                    print('\ar[Postmaster]\ax ' .. label .. ' stopped because you died. Respawn, then run again.')
+                end
+                return false
+            end
+        else
+            -- 4. A genuine failure - retry once.
+            if attempt < 2 then
+                print('\ay[Postmaster]\ax ' .. label .. ' failed - retrying once...')
+                mq.delay(3000)
+            end
+            attempt = attempt + 1
         end
     end
     -- Every automated step funnels through retryStep, so this one hook covers all of them: whatever
@@ -2906,14 +3155,6 @@ local function heldParcelId(idx, silent)
     return nil
 end
 
--- MQ has no native "safe/no-combat zone" flag (AL, 2026-08-11, confirmed - not guessed) - reuses this
--- project's own existing zone constants rather than a second duplicate table. AL: shrouding happens in
--- PoK, and engaging Sneak immediately afterward meant walking the whole PoK/Guild-Lobby hub portion of
--- travel at Sneak's reduced speed for zero safety benefit, since those zones are never dangerous.
-local function inSafeHubZone()
-    local zid = mq.TLO.Zone.ID() or 0
-    return (mq.TLO.Zone.ShortName() or "") == zones.pokShort or zid == zones.guildLobby or zid == zones.neighborhood
-end
 
 -- AL, 2026-08-11: arrived in PoK "beat up a bit" after escaping Erudin, then died to the Halas zone-in
 -- guards partly for having gone in already hurt - "should help" to heal up first. Free, risk-free
@@ -2924,7 +3165,7 @@ end
 -- otherwise a multi-minute heal would look like a navigation stall the instant polling resumes.
 
 ensureHealed = function()
-    if not inSafeHubZone() then return false end
+    if not zones.inSafeHub() then return false end
     if (mq.TLO.Me.PctHPs() or 100) >= 100 then return false end
     print('\ay[Postmaster]\ax healing up before continuing (' .. tostring(mq.TLO.Me.PctHPs()) .. '% HP)...')
     mq.cmd('/sit on')
@@ -2966,7 +3207,7 @@ local function considerSpawnId(id, npcName)
     -- reintroducing the old "-- looks like" assumption that broke on Ticar in the first place.
     mq.event(CONSIDER_EVENT, npcName .. ' #1# (Lvl#*#', function(_, reaction)
         considerReaction = reaction
-        print('\ao[Postmaster]\ax raw consider capture: "' .. tostring(reaction) .. '"')
+        dbg('raw consider capture: "' .. tostring(reaction) .. '"')   -- v2.63: debug only - it was console noise
     end)
     mq.cmdf('/target id %d', id)
     mq.delay(300)
@@ -2999,11 +3240,12 @@ local HOSTILE_REACTION_WORDS = { "threat", "scowl", "attack" }
 -- complete list. Anything matching NEITHER list is treated as hostile and logged once (see below), so
 -- this gets completed from real field readings instead of from a guess about EQ's exact wording.
 --
--- "dubious" is in NEITHER list ON PURPOSE. The project has a field case where Dubious blocked an
--- interaction outright (Vicus Nonad, evil-race character), but whether Dubious means "will attack" or
--- merely "won't trade" has never been verified in game - so it falls through to the unknown branch and
--- gets the cautious treatment, without anyone having to assert a game fact they haven't checked.
-local SAFE_REACTION_WORDS = { "indifferent", "amiabl", "kindly", "warmly", "ally", "apprehensiv" }
+-- "dubious" was in NEITHER list until v2.63, on purpose: whether Dubious means "will attack" had never been
+-- checked. Now it has: Lady Shae read Dubious to a VISIBLE Xanley (no Sneak, no Hide) and never attacked (AL,
+-- 2026-09-28), and the Faction tab's Dubious goal is where guards stop attacking on sight. Left out, it latched
+-- stealth over all of West Freeport for one glowering NPC (AL's 2.62 run). Dubious still blocks some QUESTS
+-- (Vicus) - that is a quest's own check, not an attack.
+local SAFE_REACTION_WORDS = { "indifferent", "amiabl", "kindly", "warmly", "ally", "apprehensiv", "dubious" }
 
 -- Reaction wordings already reported, so an unfamiliar one warns ONCE rather than on every consider.
 -- (SCRIPT_SELFCHECK cat 11: announcements that repeat every cycle instead of once.)
@@ -3033,6 +3275,114 @@ local function reactionIsSafe(reaction)
     return false
 end
 
+-- Sneak and Hide, set to a WANTED state - never pressed blind (v2.48; replaces engageRadiusWatchStealth).
+-- Treated as ONE unit, "invis" (v2.51, AL): both on, or both off - see the end of the function.
+-- Both are TOGGLES, and the game changes them behind a script's back - zoning drops Hide, a step taken
+-- without a working Sneak drops it ("You have moved and are no longer hidden!"), a trade drops it. So each is
+-- pressed only while its state reads the opposite of what is wanted: Me.Sneaking is the spawn's sneak flag,
+-- bare Me.Invis its HideMode (MQ2SpawnType.cpp) - for a character with no invis spell on, that is Hide.
+-- AL, 2.47, a shrouded Xanley entering South Qeynos: the blind presses turned Hide ON while "dropping" the
+-- last zone's stealth (zoning had already dropped it), scanned hidden, then turned it OFF while "engaging" -
+-- he walked visible past two scowling Marsingers with only Sneak on.
+-- Hide only takes STANDING STILL - the client's own "You must stand perfectly still to hide!" - which is why
+-- a latch fired mid-walk never hid him. So a walk is paused first - but only an ACTIVE one: /nav pause is
+-- refused otherwise ("Navigation must be active to pause"), which is what took the pause out in v1.53.
+-- Hide goes on only over a working Sneak - moving hidden without one drops it at the first step.
+-- `tries` (turning on only): press again as each ability comes back ready, that many rounds. The waits are
+-- mq.delay, not waitUntil, because waitUntil runs Radius Watch, which calls this - but each still ends on
+-- Stop or a closed script. Returns whether the wanted state holds at the end.
+-- `keepSneak` - the ONE allowed half-state, Sneak without Hide. Turning OFF (v2.52): drop Hide and leave Sneak,
+-- for a say from behind an NPC. Turning ON (v2.58): put Sneak back ALONE - the Faction tab's coin give re-arms a
+-- dropped Sneak standing behind Fabian, where Hide is off on purpose (AL's decision 3).
+local function setStealth(on, tries, keepSneak)
+    local function isHidden() return mq.TLO.Me.Invis() == true end
+    local function inCombat() return (mq.TLO.Me.CombatState() or ""):upper() == "COMBAT" end
+    -- A wait ends on Stop, a closed script or COMBAT too - never stand still waiting on a cooldown while hit.
+    local function readyOrStop(ability)
+        return automation.stop or not running or inCombat() or mq.TLO.Me.AbilityReady(ability)() == true
+    end
+    -- v2.55 - TURNING ON WAITS FOR THE GAME'S VERDICT, not a clock. "You begin to hide..." takes a moment before
+    -- "You have hidden yourself from view." or "You failed to hide yourself." (the client's own strings, 346/345),
+    -- and 2.54 judged it 1.5 s after the press - it could read "failed" too soon. The other refusals count as a
+    -- verdict too: 12424 "You must stand perfectly still to hide!", 12423 "You can't try to hide while attacking.",
+    -- 342 "You must wait longer before you can hide or evade."; for Sneak 347 "...quiet as a cat stalking its
+    -- prey." / 348 "...quiet as a herd of running elephants.", 12420 while attacking, 12421 only on dry land.
+    local function pressAndJudge(ability, okLines, failLines)
+        local verdict = nil
+        local names = {}
+        for i, line in ipairs(okLines) do
+            names[#names + 1] = 'PMStealthOk' .. i
+            mq.event(names[#names], line, function() verdict = true end)
+        end
+        for i, line in ipairs(failLines) do
+            names[#names + 1] = 'PMStealthFail' .. i
+            mq.event(names[#names], line, function() verdict = false end)
+        end
+        mq.cmd('/doability "' .. ability .. '"')
+        mq.delay(8000, function()
+            for _, n in ipairs(names) do mq.doevents(n) end
+            return verdict ~= nil or automation.stop or not running
+        end)
+        for _, n in ipairs(names) do mq.unevent(n) end
+    end
+    -- v2.49: never turn stealth ON in a fight - the client refuses Hide then ("You can't try to hide while
+    -- attacking"), and Sneak only slows the escape.
+    if on and inCombat() then return false end
+    local paused = false
+    if on and mq.TLO.Navigation.Active() and not mq.TLO.Navigation.Paused() then
+        mq.cmd('/nav pause')
+        paused = true
+    end
+    if on then mq.delay(2000, function() return not mq.TLO.Me.Moving() end) end
+    local ok = false
+    for _ = 1, (on and (tries or 1)) or 1 do
+        if mq.TLO.Me.Sneaking() ~= on and not (keepSneak and not on) then
+            if on then
+                mq.delay(15000, function() return readyOrStop("Sneak") end)
+                pressAndJudge("Sneak", { "You are as quiet as a cat stalking its prey." },
+                    { "You are as quiet as a herd of running elephants.", "You can't start sneaking while attacking.",
+                      "You can only sneak on dry land." })
+            else
+                mq.cmd('/doability "Sneak"')
+                mq.delay(1500, function() return mq.TLO.Me.Sneaking() == on end)
+            end
+        end
+        if isHidden() ~= on and (not on or mq.TLO.Me.Sneaking()) and not (on and keepSneak) then
+            if on then
+                mq.delay(15000, function() return readyOrStop("Hide") end)
+                pressAndJudge("Hide", { "You have hidden yourself from view." },
+                    { "You failed to hide yourself.", "You must stand perfectly still to hide!",
+                      "You can't try to hide while attacking.", "You must wait longer before you can hide or evade." })
+            else
+                mq.cmd('/doability "Hide"')
+                mq.delay(1500, function() return isHidden() == on end)
+            end
+        end
+        if on and keepSneak then
+            ok = mq.TLO.Me.Sneaking() == true
+        else
+            ok = (keepSneak or mq.TLO.Me.Sneaking() == on) and isHidden() == on
+        end
+        dbg(string.format('stealth %s: sneaking %s, hidden %s', on and 'on' or 'off', tostring(mq.TLO.Me.Sneaking()),
+            tostring(isHidden())))
+        if ok or automation.stop or not running or inCombat() then break end
+    end
+    -- v2.51 - ONE UNIT (AL: *"view it as a whole as its 'invis' together"*): turning on either gets both, or
+    -- ends with both OFF. Half is the worst of both - Sneak alone is slow and still seen.
+    if on and not ok then
+        if mq.TLO.Me.Sneaking() then
+            mq.cmd('/doability "Sneak"')
+            mq.delay(1500, function() return not mq.TLO.Me.Sneaking() end)
+        end
+        if isHidden() then
+            mq.cmd('/doability "Hide"')
+            mq.delay(1500, function() return not isHidden() end)
+        end
+    end
+    if paused then mq.cmd('/nav pause off') end
+    return ok
+end
+
 -- Combat detected, anywhere a shrouded character is waiting on something - not just mid-approach.
 -- Sneak/Hide is meaningless once aggro lands, and this is deliberately NOT a combat script - killing a
 -- KOS-faction NPC would only make the faction problem worse, not solve it. AL, 2026-08-11: "I would
@@ -3048,6 +3398,36 @@ end
 -- guards during PLAIN TRAVEL (not the approach-a-KOS-NPC sequence at all) and died before ever reaching
 -- the point where approachAndInteract's checks would have run - Sneak reduces detection chance, it was
 -- never a guarantee, and nothing was watching for the moment it failed until now.
+-- Get OUT of this zone and leave the rest to retryStep's recovery (v2.55 - shared by the combat flee and by
+-- "invis will not go on here"). v2.50 (AL): run BACK THE WAY WE CAME - "a simple run back one zone where we just
+-- came from" - not all the way to PoK. `/easyfind <shortname>` walks to this zone's closest connection to that
+-- zone (EasyFind's own docs), and crossing any zone line drops the aggro. The PoK run stays as the fallback when
+-- where we came from is not known. Sets justFledCombat, which every wait, travel leg and batch loop treats as
+-- "stand aside", and which keeps a repeat trigger from re-firing the run (below).
+function automation.retreat(why, spoken)
+    local here = mq.TLO.Zone.ShortName() or ""
+    local back = automation.zoneFrom
+    automation.fledFrom = here
+    if back and back ~= "" and back ~= here then
+        print('\ar[Postmaster]\ax ' .. why .. ' - running back to ' .. back .. ' to shake it off...')
+    else
+        back = nil
+        print('\ar[Postmaster]\ax ' .. why .. ' - running for a zone line...')
+    end
+    ui.announce("alert.wav", spoken, true)
+    justFledCombat = true
+    mq.cmd('/stick off')
+    -- v2.52: ALWAYS drop invis, latched or not (AL: *"have to THEN turn off sneak and RUN"*) - a say from behind
+    -- leaves Sneak on, and a Sneak left on turns the run into a crawl. By state: harmless when already off.
+    setStealth(false)
+    radiusWatchLatched = false
+    if back then
+        mq.cmd('/squelch /easyfind ' .. back)
+    else
+        mq.cmd('/travelto ' .. zones.pokShort)
+    end
+end
+
 fleeIfInCombat = function()
     if (mq.TLO.Me.CombatState() or ""):upper() ~= "COMBAT" then return false end
     -- v1.50: idempotent - only react on the FIRST combat detection this attempt, not every repeat ping.
@@ -3055,27 +3435,75 @@ fleeIfInCombat = function()
     -- combat tick, each one re-firing /travelto zones.pokShort - which resets EasyFind's routing progress
     -- from scratch every time (confirmed: each call produced a fresh "Traveling to: X" + restarted the
     -- first hop), so a travel that was actually working never got the chance to finish. Once already
-    -- fleeing, the existing /travelto is still the right response - a repeat hit doesn't need a NEW
-    -- reaction, it just means keep letting the current one run. Returning false here (not true) also
-    -- means the calling wait no longer aborts on a repeat hit - it just keeps polling normally, which is
-    -- what actually let the already-working travel finish in the retest.
+    -- fleeing, the existing run is still the right response - a repeat hit doesn't need a NEW reaction, it
+    -- just means keep letting the current one run. Returning false here (not true) also means the calling
+    -- wait no longer aborts on a repeat hit - it just keeps polling normally, which is what actually let
+    -- the already-working travel finish in the retest.
     if justFledCombat then return false end
-    print('\ar[Postmaster]\ax in combat - aborting and running for a zone line...')
-    -- Safe from spam: fleeIfInCombat is idempotent per attempt (justFledCombat), so a long fight
-    -- alerts once rather than on every poll.
-    ui.announce("alert.wav", "In combat.<silence msec='250'/> Breaking off, and running for the zone line.", true)
-    justFledCombat = true
-    mq.cmd('/stick off')
-    -- Combat means stealth already failed - Sneak's speed penalty is now pure downside with nothing
-    -- left to protect, and we're leaving this zone anyway, so radiusWatch's per-zone latch (v1.47) no
-    -- longer applies. Only touches Sneak/Hide when WE know for certain radiusWatch turned them on -
-    -- doesn't guess at approachAndInteract's own independent stealth engagement.
-    if radiusWatchLatched then
-        mq.cmd('/doability "Hide"')
-        mq.cmd('/doability "Sneak"')
-        radiusWatchLatched = false
+    -- Safe from spam: idempotent per attempt (justFledCombat), so a long fight alerts once, not every poll.
+    automation.retreat("in combat", "In combat.<silence msec='250'/> Breaking off, and running for the zone line.")
+    return true
+end
+
+-- v2.55 - IN A HOSTILE ZONE, NEVER WALK ON VISIBLE. 2.54: "You failed to hide yourself." - and the walk resumed
+-- anyway, straight past Sentinel Flavius (level 50), who killed level 10 Xanley in Toxxulia (AL). So: put invis
+-- on standing still, a few tries as Hide comes back ready; if it still will not take, back off the way we came,
+-- like the combat flee - retryStep's recovery rests, waits and re-hides standing still on the way back in. The
+-- five-flee cap in retryStep bounds it: a Hide skill that never lands stops the run with an alert.
+-- Called by Radius Watch with its latch ALREADY set, so setStealth's own waits cannot re-enter it.
+function automation.hideOrBackOff()
+    if setStealth(true, 4) or justFledCombat or automation.stop or not running then return end
+    if (mq.TLO.Me.CombatState() or ""):upper() == "COMBAT" then
+        fleeIfInCombat()
+    else
+        automation.retreat("could not get hidden here",
+            "Could not hide.<silence msec='250'/> Backing off to the zone line.")
     end
-    mq.cmd('/travelto ' .. zones.pokShort)
+end
+
+-- Carry on after a flee (v2.50, AL: *"just run to the zone then we can turn around zone back ... and attempt
+-- the next step"*, skipping what is done). Waits until the flee has really crossed out of the zone it left -
+-- the crossing drops the aggro - re-arms Sneak+Hide standing at the line if this zone is known hostile, says
+-- so, waits 10 s (30 s when the same NPC drew a fight before - AL's two numbers), and hands back to
+-- retryStep, which reruns the step: every step skips what is done and walks itself back in. Returns false on
+-- a death, a Stop, or no way clear. On `automation` because retryStep sits above setStealth in the file.
+function automation.recoverFromFlee(again)
+    local from = automation.fledFrom or ""
+    -- /easyfind can find no connection and leave us standing in the fight - then the old run for PoK.
+    mq.delay(1500)
+    if (mq.TLO.Zone.ShortName() or "") == from and not mq.TLO.Navigation.Active() then
+        dbg('the flee found no way back - running for PoK instead.')
+        mq.cmd('/travelto ' .. zones.pokShort)
+    end
+    if not waitWhileProgressing(function() return (mq.TLO.Zone.ShortName() or "") ~= from end, 20000, 180000) then
+        if running and not automation.stop and not mq.TLO.Me.Hovering() then
+            print('\ar[Postmaster]\ax could not get clear of the fight - stopping. Get clear, then run again.')
+        end
+        return false
+    end
+    local clearAt = mq.gettime()
+    mq.delay(2000)   -- settle after the zone-in
+    local secs = again and 30 or 10
+    -- v2.53 - HEAL TO 80% BEFORE GOING BACK (AL): the Flynn run made the line on 5.6% health, and until now the
+    -- run went back in after 10 s whatever the health. Sit until 80% - the safe-hub heal-up (ensureHealed) never
+    -- runs out here. The 10 s / 30 s wait runs ALONGSIDE the heal, not after it. A new fight ends the sit at once.
+    if (mq.TLO.Me.PctHPs() or 100) < 80 then
+        print(string.format('\ay[Postmaster]\ax clear of the fight at %d%% health - resting to 80%% before going back'
+            .. ' into %s...', mq.TLO.Me.PctHPs() or 0, from))
+        mq.cmd('/sit on')
+        waitUntil(function()
+            return (mq.TLO.Me.PctHPs() or 100) >= 80 or (mq.TLO.Me.CombatState() or ""):upper() == "COMBAT"
+        end, 600000, 1000)
+        mq.cmd('/stand')
+        if not running or automation.stop or mq.TLO.Me.Hovering() then return false end
+    end
+    if radiusWatchKnownHostileZones[mq.TLO.Zone.ID() or 0] then setStealth(true, 3) end
+    local left = math.max(0, secs * 1000 - (mq.gettime() - clearAt))
+    print(string.format('\ay[Postmaster]\ax clear of the fight (%d%% health). Going back into %s in %d seconds%s...',
+        mq.TLO.Me.PctHPs() or 0, from, math.ceil(left / 1000), again and ' - this spot drew a fight before' or ''))
+    if left > 0 then waitUntil(function() return false end, left, 500) end
+    if not running or automation.stop or mq.TLO.Me.Hovering() then return false end
+    justFledCombat = false
     return true
 end
 
@@ -3125,29 +3553,6 @@ local function stickBehind(npcName)
     return true
 end
 
--- Shared by both radiusWatch latch paths (fresh scan finds a hostile / re-entering a known-hostile
--- zone) - Sneak then Hide.
--- v1.53: no longer pauses nav around the toggles. AL, 2026-08-15 field log: `/nav pause` fired right at
--- a zone transition (the "already known hostile - re-latch immediately" branch) and got REJECTED -
--- "[Nav] Navigation must be active to pause" - because the underlying /travelto journey hadn't resumed
--- navigating in the new zone yet. A second, unrelated `/nav pause` later in the same log succeeded but
--- was never followed by a matching "Resuming Navigation" - the character just stood still until the
--- 20s stuck-detection gave up and the whole batch failed. Every OTHER `/nav pause` already proven safe
--- in this script (Erudin gem, Halas exit, movement-buff casting) fires mid-way through an already-
--- active, already-established /nav id walk - carefully verified nav is genuinely still churning at that
--- exact moment. This call fires the instant a zone change is DETECTED, which can be before an
--- EasyFind-driven multi-hop /travelto has resumed at all - pausing something that isn't reliably active
--- yet is the wrong tool. Hide was never guaranteed to land cleanly anyway (already-documented pre-
--- existing unreliability); Sneak alone still gives real protection, and fleeIfInCombat() is the safety
--- net if Hide's attempt happens to miss. Not risking the whole travel chain is worth more than
--- maximizing Hide's engage odds.
-local function engageRadiusWatchStealth()
-    mq.cmd('/doability "Sneak"')
-    mq.delay(500)
-    mq.cmd('/doability "Hide"')
-    mq.delay(1000)
-end
-
 -- Radius Watch pipeline (v1.47) - replaces sneakForTravel()'s old "wear Sneak the whole trip" design.
 -- AL, 2026-08-14, field death crossing Tox Forest: "guards kill me because we are sneak (super slow
 -- walk)." Sneak's movement-speed penalty was itself the danger, not detection - moving at a crawl means
@@ -3173,30 +3578,52 @@ end
 -- IMMEDIATELY as part of the same zone-change reset - no exposed scan-first gap on a repeat visit.
 radiusWatch = function()
     if not mq.TLO.Me.Shrouded() then return end
+    -- v2.50: remember the zone we came from - the combat flee runs back into it. Kept here because this runs
+    -- on every wait poll while shrouded, and a flee only happens shrouded; before the flee check below, so it
+    -- keeps counting through one.
+    local nowZone = mq.TLO.Zone.ShortName() or ""
+    if nowZone ~= "" and nowZone ~= automation.zoneNow then
+        automation.zoneFrom, automation.zoneNow = automation.zoneNow, nowZone
+    end
+    -- v2.49: sit a flee out entirely. The flee clears the latch, and on the next poll this scanned, found the
+    -- room still hostile and put Sneak back ON mid-fight - a crawl out while being hit (AL). Nor may a zone
+    -- line on the way out re-latch. recoverFromFlee re-arms stealth once over the line, then clears the flag.
+    if justFledCombat then return end
     local zoneId = mq.TLO.Zone.ID() or 0
     if zoneId ~= radiusWatchZoneId then
         -- Real zone-line transition, not an in-zone teleport (the Erudin gem doesn't change Zone.ID) -
-        -- drop the PREVIOUS zone's protection either way, then decide fresh for this new one.
-        if radiusWatchLatched then
-            mq.cmd('/doability "Hide"')
-            mq.cmd('/doability "Sneak"')
-        end
+        -- decide fresh for this new zone. v2.48: a known-hostile zone KEEPS what is still on (zoning drops
+        -- Hide, so setStealth puts it back); any other zone drops the previous zone's stealth, by state.
+        local wasLatched = radiusWatchLatched
         radiusWatchZoneId = zoneId
         radiusWatchLatched = false
         radiusWatchConsidered = {}
 
         if radiusWatchKnownHostileZones[zoneId] then
             print('\ay[Postmaster]\ax this zone read hostile earlier this run - going Sneak+Hide immediately.')
-            radiusWatchLatched = true
-            engageRadiusWatchStealth()
+            radiusWatchLatched = true   -- before hideOrBackOff: it must not be re-entered from its own waits
+            automation.hideOrBackOff()   -- v2.55: invis on standing still, or back off - never walk on visible
             return
         end
+        if wasLatched then setStealth(false) end
     end
 
-    if radiusWatchLatched then return end   -- already protected this zone - nothing left to check
-    if inSafeHubZone() then return end   -- PoK/Guild Lobby/the neighborhood are never dangerous - don't
+    if radiusWatchLatched then
+        -- v2.51 - KEEP THE UNIT UP (AL: Sneak and Hide "not always both on or off"). The latch means invis ON
+        -- for this zone, and the game knocks halves off behind us: a step on a failed Sneak roll ("You have
+        -- moved and are no longer hidden!"), a trade, a skill that did not take. So when either half is off,
+        -- stop and put both back - but only once Hide is off cooldown, or a low-skill character would stand and
+        -- try on every poll. Never in the middle of an NPC interaction (it unhides on purpose for a say).
+        if not automation.interacting and not (mq.TLO.Me.Sneaking() and mq.TLO.Me.Invis())
+            and mq.TLO.Me.AbilityReady("Hide")() then
+            dbg('invis dropped - putting it back.')
+            automation.hideOrBackOff()   -- v2.55: or back off - 2.54 walked on visible after a failed Hide
+        end
+        return
+    end
+    if zones.inSafeHub() then return end   -- PoK/Guild Lobby/the neighborhood are never dangerous - don't
                                           -- bother scanning at all, same reasoning ensureHealed already
-                                          -- uses these zones for (see inSafeHubZone's own comment)
+                                          -- uses these zones for (see zones.inSafeHub's own comment)
 
     local count = mq.TLO.SpawnCount("npc radius " .. tuning.guardRadius)() or 0
     for i = 1, count do
@@ -3210,9 +3637,10 @@ radiusWatch = function()
                 if reaction and not reactionIsSafe(reaction) then
                     print('\ay[Postmaster]\ax ' .. name .. ' reads hostile nearby (' .. reaction
                         .. ') - going Sneak+Hide for the rest of this zone.')
-                    radiusWatchLatched = true
+                    radiusWatchLatched = true   -- before hideOrBackOff: it must not be re-entered from its own waits
                     radiusWatchKnownHostileZones[zoneId] = true
-                    engageRadiusWatchStealth()
+                    -- Stops the walk, hides standing still, walks on (v2.48) - or backs off (v2.55).
+                    automation.hideOrBackOff()
                     return
                 end
             end
@@ -3220,73 +3648,95 @@ radiusWatch = function()
     end
 end
 
-local function approachAndInteract(npcName, interactFn)
-    if not navToNpc(npcName) then
-        print('\ar[Postmaster]\ax could not reach ' .. npcName .. ' to approach.')
+-- `keepHidden` (v2.37): for an ITEM GIVE to a hostile NPC, stay hidden through the interaction. A hail or a
+-- say does not register while hidden, which is why the stealth path below unhides first - but a trade does:
+-- AL's August Iksar handed Lashun Novashine 1000 Bone Chips at a time while still hidden, at Scowls. Unhiding
+-- for a trade is exactly the moment a scowling NPC attacks.
+-- `faceOk` (v2.56): this NPC is known by QUEST LOGIC never to attack, so in invis we deal with them from where we
+-- stand, no behind maneuver. Only Vicus Nonad: the script deals with him only once Antonius Bayle is at least
+-- Apprehensive - the Taxes quest itself refuses anything less - and his kneeling-on-a-bed pose made the maneuver
+-- hard (AL). Never judged by a con: see the v2.56 note below.
+-- `sneakAnyway` (v2.58): take the invis path below WITHOUT a shroud - a Rogue on the Faction tab's coin give,
+-- who has Sneak and Hide of their own (AL's decision 1). Everything else about the path is the same.
+-- `spot` (v2.60): walk to THIS loc ({ y, x, z }) instead of the NPC, and no stick - AL's own standing spot behind
+-- Palatos Kynarn, from which the bartender's shop opens too, so the gives and the restocks need no step.
+approachAndInteract = function(npcName, interactFn, keepHidden, faceOk, sneakAnyway, spot)
+    -- v2.57 - IN A SHROUD, EVERY QUEST NPC FROM BEHIND, IN INVIS (AL: *"every quest NPC from behind in a shroud...
+    -- the Mail NPCs will not [give a pass]. Most are in good cities and are on League of Antonican Bard faction or
+    -- similar."*). Only `faceOk` - quest logic, Vicus - is dealt with from where we stand. Invis goes on BEFORE the
+    -- walk, standing still, and the zone is latched so Radius Watch keeps the unit up on the way: the August path
+    -- walked up to ~14 units VISIBLE, then let a shrouded con decide - and a shrouded con can read a KOS NPC as safe
+    -- (Ticar, 2.55/2.56). Will not take → back off (automation.hideOrBackOff), never walk up visible.
+    local shrouded = mq.TLO.Me.Shrouded() or sneakAnyway == true
+    if shrouded and not faceOk then
+        radiusWatchZoneId = mq.TLO.Zone.ID() or 0   -- latch FIRST (this zone), so its waits cannot re-enter it
+        radiusWatchLatched = true
+        if not (mq.TLO.Me.Sneaking() and mq.TLO.Me.Invis()) then
+            automation.hideOrBackOff()
+            if justFledCombat or automation.stop or not running then return nil end
+        end
+    end
+    local reached
+    if spot then
+        mq.cmdf('/nav loc %.2f %.2f %.2f log=off', spot.y, spot.x, spot.z)
+        waitUntil(function() return mq.TLO.Navigation.Active() end, 5000, 100)
+        waitUntil(function() return not mq.TLO.Navigation.Active() end, 180000, 200)
+        local dy, dx = (mq.TLO.Me.Y() or 0) - spot.y, (mq.TLO.Me.X() or 0) - spot.x
+        reached = math.sqrt(dy * dy + dx * dx) <= 6
+    else
+        reached = navToNpc(npcName)
+    end
+    if not reached then
+        if not justFledCombat then print('\ar[Postmaster]\ax could not reach ' .. npcName .. ' to approach.') end
         return nil
     end
+    -- `usedStealth`: we are in invis for this NPC, so it drops for a say and comes back after. For a faceOk NPC,
+    -- only if we happened to be in invis already (a latched zone) - never switched on just for them.
     local usedStealth = false
-    if mq.TLO.Me.Shrouded() then
-        -- Already latched protected for this zone (radiusWatch, v1.47)? Skip the baseline consider
-        -- entirely - we already know this zone is hostile, and re-considering while already Sneak+Hidden
-        -- is exactly the kind of reading we agreed never to trust (see POSTMASTER_PIPELINE.md "Radius
-        -- Watch pipeline" - the Sentinel Drom ambiguity). Still need /stick - that's about landing
-        -- correctly to interact, not about detection.
-        if radiusWatchLatched then
-            if not stickBehind(npcName) then return nil end
-            usedStealth = true
+    if shrouded then
+        if faceOk then
+            usedStealth = mq.TLO.Me.Sneaking() or mq.TLO.Me.Invis()
         else
-            local baseline = considerNpc(npcName)
-            if baseline and not reactionIsSafe(baseline) then
-                print('\ay[Postmaster]\ax ' .. npcName .. ' reads hostile (' .. tostring(baseline) .. ') - switching to a protected approach.')
-                if not stickBehind(npcName) then return nil end
-
-                local safe = false
-                for _ = 1, 3 do
-                    if fleeIfInCombat() then return nil end
-                    mq.cmd('/doability "Sneak"')
-                    mq.delay(500)
-                    mq.cmd('/doability "Hide"')
-                    mq.delay(1000)
-                    if fleeIfInCombat() then return nil end
-                    local reaction = considerNpc(npcName)
-                    if reactionIsSafe(reaction) then
-                        print('\ag[Postmaster]\ax ' .. npcName .. ' reads safe while hidden: ' .. tostring(reaction))
-                        safe = true
-                        break
-                    end
-                    dbg(npcName .. ' still reads hostile (' .. tostring(reaction) .. ') - retrying hide...')
-                end
-                if not safe then
-                    print('\ar[Postmaster]\ax could not get a safe reading on ' .. npcName .. ' after 3 attempts.')
-                    return nil
-                end
-                usedStealth = true
-            elseif baseline then
-                print('\ag[Postmaster]\ax ' .. npcName .. ' reads non-hostile (' .. tostring(baseline) .. ') - no stealth needed.')
-            end
+            -- v2.51 (AL): *"when in sneak mode PC must interact an NPC from behind them. The point of being invis
+            -- in this form is because we are in danger, sometimes from the NPC we are dealing with."*
+            -- A `spot` IS behind him (AL chose it there), so no stick.
+            if not spot and not stickBehind(npcName) then return nil end
+            usedStealth = true
         end
     end
 
-    if usedStealth then
-        mq.cmd('/doability "Hide"')   -- toggle off - interaction won't register while hidden
-        mq.delay(300)
-        if fleeIfInCombat() then return nil end   -- the NPC can react the instant it sees us unhide
+    -- Radius Watch keeps invis up in a latched zone; tell it an interaction is under way, so it does not put
+    -- invis back in the middle of a say (v2.51). Cleared on every way out below.
+    automation.interacting = true
+    if usedStealth and not keepHidden then
+        -- A hail/say won't register while hidden. Drop HIDE ONLY and keep Sneak for the say (v2.52, AL's trial -
+        -- CONFIRMED at Flynn's back, 2026-09-28: the say landed, the tax came, he turned KOS, the flee dropped Sneak
+        -- and ran - a level 10 shrouded Iksar made the zone line on 5.6% health). The one half-state the unit rule
+        -- (v2.51) allows; the flee drops Sneak too.
+        setStealth(false, nil, true)
+        if fleeIfInCombat() then   -- the NPC can react the instant it sees us unhide
+            automation.interacting = false
+            return nil
+        end
     end
 
     local result = interactFn()
 
-    if usedStealth and not fleeIfInCombat() then
-        mq.cmd('/doability "Sneak"')
-        mq.delay(300)
-        mq.cmd('/doability "Hide"')
+    -- A fight straight after the interaction sends the flee off AT ONCE - after a hidden hand-over too (v2.54: a
+    -- trade breaks Hide, and a KOS recipient turns on us; before, the check sat behind `not keepHidden` and the
+    -- flee waited for the next walk's first poll). Shrouded only, like every other flee check. And invis is never
+    -- put back on while a flee is under way (v2.52: a flee fired INSIDE interactFn reports only once).
+    local fled = justFledCombat or (shrouded and fleeIfInCombat())
+    if usedStealth and not keepHidden and not fled then
+        setStealth(true, 2)
     end
+    automation.interacting = false
 
     return result
 end
 
 -- Pickup half only (Phase 3.5 batching - see POSTMASTER_PIPELINE.md). Returns the item id held, or
--- nil on failure. Caller (runClusterBatch) has already decided this idx needs a real pickup via
+-- nil on failure - or true with the row marked Delivered when the sender says it was delivered already (v2.66). Caller (runClusterBatch) has already decided this idx needs a real pickup via
 -- heldParcelId - no existence re-check here.
 local function pickupOnly(idx)
     local d = DELIVERIES[idx]
@@ -3309,6 +3759,13 @@ local function pickupOnly(idx)
     -- already across), and boarding then would be wrong/wasted.
     if d.fromZoneShort == "halas" and (mq.TLO.Me.Y() or 0) < -300 then rideHalasShuttleIn() end
 
+    -- v2.66 - THE SENDER KNOWS (AL, 2026-09-30). Asked again for a letter already delivered, a sender answers "I
+    -- applaud your enthusiasm, <name>. I cannot offer you another delivery at this time..." - a per-letter record kept
+    -- on the SERVER (a new bard, mid-Challenge, back at Ticar after an Undo). It is the only "already done" signal the
+    -- game gives, so the row is marked Delivered and the batch carries on instead of stopping on "no parcel". Heard
+    -- only straight after the bare CITY word: Lislia and Ton each hand out two letters, and a reply to "deliver"
+    -- alone could be about the other one.
+    local refused = false
     local parcelId = approachAndInteract(d.from, function()
         sayPhrase(d.from, "I will deliver to " .. d.city)
         if not waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
@@ -3317,8 +3774,18 @@ local function pickupOnly(idx)
             -- lines. Single-destination NPCs already answered the one-liner above.
             sayPhrase(d.from, "deliver")
             mq.delay(700)
+            pcall(mq.unevent, 'PostmasterRefused')
+            mq.event('PostmasterRefused', d.from .. " says, 'I applaud your enthusiasm#*#cannot offer you another delivery#*#",
+                function() refused = true end)
+            mq.flushevents('PostmasterRefused')   -- anything matched before the city word is not about this letter
             sayPhrase(d.from, d.city)
-            if not waitUntil(function() return (mq.TLO.Cursor.ID() or 0) > 0 end, 5000) then
+            waitUntil(function()
+                mq.doevents('PostmasterRefused')
+                return (mq.TLO.Cursor.ID() or 0) > 0 or refused
+            end, 5000)
+            pcall(mq.unevent, 'PostmasterRefused')
+            if (mq.TLO.Cursor.ID() or 0) == 0 then   -- a letter on the cursor wins over any refusal
+                if refused then return 'delivered' end
                 print('\ay[Postmaster]\ax no parcel from ' .. d.from .. ' - if you already hold this letter, tell me its name; otherwise verify the "deliver / ' .. d.city .. '" keywords.')
                 return nil
             end
@@ -3331,6 +3798,13 @@ local function pickupOnly(idx)
         return pid
     end)
     if not parcelId then return nil end
+    if parcelId == 'delivered' then
+        state.deliveries[idx] = true
+        state.held[idx] = nil
+        saveState()
+        print(string.format('\ay[Postmaster]\ax %s says your letter for %s was delivered already - marked Delivered (Undo on the Deliveries tab if that is wrong).', d.from, d.to))
+        return true
+    end
 
     for _ = 1, 4 do
         if (mq.TLO.Cursor.ID() or 0) == 0 then break end
@@ -3350,37 +3824,58 @@ local function pickupOnly(idx)
     return parcelId
 end
 
--- Deliver half only (Phase 3.5 batching). Requires the parcel already be held (heldParcelId finds
--- it); does NOT pick it up. One letter at a time by design - each hand-off is confirmed by checking
--- the EXACT item id is gone, not just "count dropped by one" (before the caller moves on to the next -
--- AL: no blind back-to-back hand-offs, even within a batched cluster visit).
--- Same live hostility check as pickupOnly now (approachAndInteract) - a delivery recipient can turn out
--- just as hostile as a pickup sender, and used to get zero protection here regardless of anything.
-local function deliverOnly(idx)
-    local d = DELIVERIES[idx]
-    local parcelId = heldParcelId(idx)
-    if not parcelId then
-        print('\ar[Postmaster]\ax not holding a parcel for delivery ' .. idx .. ' - pick it up first.')
-        return false
+-- Deliver half only (Phase 3.5 batching). Requires the parcels already be held (heldParcelId finds them);
+-- does NOT pick them up. `idxs` are deliveries that all go to the SAME recipient.
+-- v2.54 - ONE TRADE PER RECIPIENT (AL): every held letter for one NPC goes over in a single trade - up to the give
+-- window's four slots - instead of one trade each. A trade breaks Hide (AL, the Bone Chips runs), so each trade at
+-- a KOS Marsinger was a fight, and Tralyn Marsinger alone takes FOUR letters. Letters are matched by ITEM ID
+-- (several are called "Bardic Letter (Qeynos)"), and each is still confirmed by ITS OWN id leaving the bags - the
+-- old "no blind back-to-back hand-offs" rule (AL) now holds per letter within the trade. A letter handed back (an
+-- NPC that takes one per trade) goes over again in a following trade, as long as each trade lands something.
+-- v2.51: a hand-over, so in invis it stays HIDDEN (keepHidden) - a trade needs no visibility (v2.37). Same live
+-- hostility check as pickupOnly (approachAndInteract) - a recipient can be as hostile as a sender.
+local function deliverOnly(idxs)
+    local d = DELIVERIES[idxs[1]]
+    local pending = {}
+    for _, idx in ipairs(idxs) do
+        local pid = heldParcelId(idx)
+        if pid then
+            pending[#pending + 1] = { idx = idx, id = pid }
+        else
+            print('\ar[Postmaster]\ax not holding a parcel for delivery ' .. idx .. ' - pick it up first.')
+        end
     end
+    if #pending == 0 then return false end
     ensureShroud()   -- self-gated internally, cheap to call redundantly - same pattern as pickupOnly
     if not travelToZone(d.toZoneShort, d.to) then return false end
 
-    local delivered = approachAndInteract(d.to, function()
-        if not giveItemById(parcelId, d.to) then return false end
-        mq.delay(1000)
-        return (mq.TLO.FindItem(parcelId).ID() or 0) == 0   -- this EXACT item gone = delivered
-    end)
-
-    if delivered then
-        state.deliveries[idx] = true
-        state.held[idx] = nil
+    while #pending > 0 do
+        local ids = {}
+        for i = 1, math.min(#pending, 4) do ids[i] = pending[i].id end
+        approachAndInteract(d.to, function() return giveItemsById(ids, d.to, true) end, true)
+        local still = {}
+        for _, e in ipairs(pending) do
+            if (mq.TLO.FindItem(e.id).ID() or 0) == 0 then   -- this EXACT letter gone = delivered
+                state.deliveries[e.idx] = true
+                state.held[e.idx] = nil
+                local de = DELIVERIES[e.idx]
+                print(string.format('\ag[Postmaster]\ax delivered %d/18: %s (%s) -> %s (%s).', deliveredCount(), de.from,
+                    de.fromZone, de.to, de.toZone))
+            else
+                still[#still + 1] = e
+            end
+        end
         saveState()
-        print(string.format('\ag[Postmaster]\ax delivered %d/18: %s (%s) -> %s (%s).', deliveredCount(), d.from, d.fromZone, d.to, d.toZone))
-        return true
+        if #still == #pending then   -- nothing went over in this trade
+            if not justFledCombat then
+                print('\ar[Postmaster]\ax delivery to ' .. d.to .. ' not confirmed (parcel still held) - verify recipient / give.')
+            end
+            return false
+        end
+        pending = still
+        if justFledCombat or not running or automation.stop then return #pending == 0 end
     end
-    print('\ar[Postmaster]\ax delivery to ' .. d.to .. ' not confirmed (parcel still held) - verify recipient / give.')
-    return false
+    return true
 end
 
 -- Destination clusters (Phase 3.5): group deliveries sharing the same drop-off zone so a batch run
@@ -3461,11 +3956,26 @@ local function runClusterBatch(cluster)
         end
         local idx = table.remove(needPickup, nextPos)
         if not pickupOnly(idx) then pmBusy = false; return false end
-        held[#held + 1] = idx
+        -- v2.66: the sender may have said this letter was delivered already - then there is nothing to carry.
+        if not state.deliveries[idx] then held[#held + 1] = idx end
+        -- v2.54: a fight right AFTER a good pickup has set the flee off - stop here, or the next pickup's walk
+        -- overrides the flee's route (the tax loop's v2.49 bug, in this loop). retryStep carries on after it.
+        if justFledCombat then pmBusy = false; return false end
     end
 
+    -- v2.54: one trade per recipient - group the held letters by who they go to, in the order first met.
+    local byRecipient, order = {}, {}
     for _, idx in ipairs(held) do
-        if not deliverOnly(idx) then pmBusy = false; return false end
+        local to = DELIVERIES[idx].to
+        if not byRecipient[to] then
+            byRecipient[to] = {}
+            order[#order + 1] = to
+        end
+        table.insert(byRecipient[to], idx)
+    end
+    for _, to in ipairs(order) do
+        -- ...and stop on a flee even after a GOOD trade (Tralyn takes the letters, then turns on us).
+        if not deliverOnly(byRecipient[to]) or justFledCombat then pmBusy = false; return false end
     end
 
     -- Cluster finished: speak the city (AL, 2026-08-23 - "Qeynos mail is complete"). Deliberately
@@ -3551,14 +4061,17 @@ local function hasHyredel()
     return (mq.TLO.FindItem("=" .. items.hyredel).ID() or 0) > 0
 end
 
-local function hasSatchel()
+-- CARRIED only, on purpose (v2.29). runLysricStep refuses to hail while one is carried, so after a hail
+-- a carried satchel can only mean one just ARRIVED. The old test also counted the bank - including the
+-- account-wide shared bank - so on an alt whose shared bank held one it read true before any hail: the
+-- loop quit after the first hail whatever Lysric did, and lysricDone was saved as a false completion.
+local function carryingSatchel()
     return (mq.TLO.FindItem("=" .. items.satchel).ID() or 0) > 0
-        or (mq.TLO.FindItemBank("=" .. items.satchel).ID() or 0) > 0
 end
 
 -- Lysric drops each reward on the CURSOR rather than auto-inventorying it (AL, field-confirmed) - both
 -- Hyredel and the Satchel land here, one at a time, since the cursor only ever holds one item. Without
--- this, hasHyredel/hasSatchel never see it (they check FindItem/FindItemBank, not the cursor) and the
+-- this, hasHyredel/carryingSatchel never see it (they check FindItem, not the cursor) and the
 -- retry loop below just burns through its attempts thinking nothing arrived.
 -- Put the cursor item into a free BAG slot, deliberately, instead of letting /autoinventory choose.
 --
@@ -3611,9 +4124,9 @@ runLysricStep = function()
         print('\ar[Postmaster]\ax hail ' .. aric.name .. ' first - Lysric won\'t give the reward until the Postmaster\'s Challenge is complete.')
         return false
     end
-    -- Checks INVENTORY, not state.lysricDone or hasSatchel(). Both of those stay true once a satchel
-    -- exists anywhere including the bank, which made the documented Lore trick - bank one, hail again
-    -- for a second - unreachable from the UI. Lore only blocks a second copy in the SAME pool, so
+    -- Checks INVENTORY, not state.lysricDone or the bank. Both of those stay true once a satchel exists
+    -- anywhere including the bank, which made the documented Lore trick - bank one, hail again for a
+    -- second - unreachable from the UI. Lore only blocks a second copy in the SAME pool, so
     -- carrying one is the real blocker; a banked one is not.
     if (mq.TLO.FindItem("=" .. items.satchel).ID() or 0) > 0 then
         ui.lysricMsg = "Already carrying a satchel. Bank it first, then hail again for a second."
@@ -3638,14 +4151,14 @@ runLysricStep = function()
         lysricBusy = false
         return false
     end
-    local hadHyredel, hadSatchel = hasHyredel(), hasSatchel()
+    local hadHyredel = hasHyredel()
     local stuckOnCursor = false
     -- She performs on the same stage rotation as Aric and brushes off a hail with the SAME wording
     -- (AL captured her exact line 2026-08-24), so she gets the same treatment through the same shared
     -- helper: wait for her to come back rather than burning hails into a performance.
     --
     -- Her loop is less dangerous than Aric's ever was - it verifies REAL item drops
-    -- (hasHyredel/hasSatchel), so it could never falsely flag completion the way his did - but without
+    -- (hasHyredel/carryingSatchel) - but without
     -- this it still spent all three attempts on somebody who was demonstrably not listening, and a
     -- performance can run half an hour.
     for attempt = 1, 3 do
@@ -3662,7 +4175,7 @@ runLysricStep = function()
                 stuckOnCursor = true
                 break
             end
-            if hasHyredel() or hasSatchel() then break end
+            if hasHyredel() or carryingSatchel() then break end
             if attempt < 3 then
                 -- She was listening and still gave nothing. That is NOT a performance - most likely the
                 -- Challenge is not actually flagged server-side yet, or she has nothing left to give.
@@ -3676,9 +4189,9 @@ runLysricStep = function()
     end
 
     if hasHyredel() and not hadHyredel then print('\ag[Postmaster]\ax received ' .. itemLink(items.hyredel) .. '!') end
-    if hasSatchel() and not hadSatchel then print('\ag[Postmaster]\ax received the ' .. itemLink(items.satchel) .. '!') end
+    if carryingSatchel() then print('\ag[Postmaster]\ax received the ' .. itemLink(items.satchel) .. '!') end
 
-    if hasSatchel() then
+    if carryingSatchel() then
         state.lysricDone = true
         saveState()
         ui.lysricMsg = "Courier of Favor complete - the Featherweight Satchel is yours."
@@ -3703,7 +4216,7 @@ runLysricStep = function()
         print('\ay[Postmaster]\ax no reward received - Lysric may still be performing. Try again in a moment, or /hail her manually.')
     end
     lysricBusy = false
-    return hasSatchel()
+    return carryingSatchel()
 end
 
 local function nextUndeliveredCluster()
@@ -3744,6 +4257,1442 @@ local function runPostmasterStep()
         if not cluster then return end   -- shouldn't happen (deliveredCount check above covers it)
         if not retryStep("Run batch (" .. cluster.toZoneShort .. ")", runClusterBatch, cluster) then return end
     until not state.pmFullAuto
+end
+
+-- Faction helper quests (v2.29) - the Faction tab
+--
+-- Some quest NPCs will not deal with a character whose faction is too low: Vicus Nonad (Taxes) waits for
+-- Antonius Bayle at Apprehensive. A HELPER is a quest that raises one faction by handing an NPC something
+-- anyone can buy. Each is one row of data run by the same code, so another "buy it, give it" quest is a
+-- new row, not new logic.
+--
+-- WHAT THE GAME LETS A SCRIPT READ (measured on Live, 2026-09-26/27):
+--   * the Faction window's Reaction word for any faction - column 2 of FAC_FactionList, found by name. The
+--     list holds every faction whichever category is showing, so the name lookup always finds it;
+--   * the EARNED standing number - column 3 holds a small gauge window, List[row,3] hands that window
+--     back, and its tooltip reads "Standing: 10 / Min: -2000 / Max: 2000";
+--   * never the Reaction NUMBER (the one in brackets on hover) - it only exists while the mouse is there.
+--     It is always earned standing + the race/class/deity adjustments the game ships in its own faction
+--     tables, which was checked against every faction in the window on a test character: all 619 that
+--     could be matched landed in the right tier, with no overlaps.
+-- Tier edges from that check, run on two characters (a Vah Shir and an Iksar - every tier seen):
+-- Apprehensive starts at exactly -100 (the highest Dubious was -101), Indifferent at 0, Amiably at 100.
+-- The top three are only BRACKETED so far - Kindly somewhere in 380-500, Warmly 552-750, Ally 1001-1101 -
+-- so `starts` holds the TOP of each bracket (v2.30). That is the safe side: a run always STOPS on the
+-- word, never the number, so an estimate that is a little high only buys a few spare items; one that is
+-- low would never stop a run early either, but would leave it short and send it back to the vendor.
+-- A hover on the tier below ("N points to Kindly") pins each one exactly.
+local faction = {
+    tiers  = { "Scowls", "Threatening", "Dubious", "Apprehensive", "Indifferent", "Amiably", "Kindly", "Warmly", "Ally" },
+    -- v2.59: Dubious - where guards stop attacking on sight. EXACT: AL's hover on Xanley's The Freeport Militia,
+    -- "150 points to Dubious" at -650 (earned 0, Iksar -600, Cazic-Thule -50), 2026-09-28.
+    starts = { Dubious = -500, Apprehensive = -100, Indifferent = 0, Amiably = 100, Kindly = 500, Warmly = 750, Ally = 1101 },
+    goals  = { "Dubious", "Apprehensive", "Indifferent", "Amiably", "Kindly", "Warmly", "Ally" },
+    helpers = {
+        {
+            key = "bonechips", title = "Bone Chips", faction = "Antonius Bayle",
+            neededFor = "Vicus Nonad (Taxes) will not help below Apprehensive.",
+            item = "Bone Chips",
+            -- Two chips per point: 200 chips moved a Dark Elf's Antonius Bayle from -166 to -67 in one
+            -- trade (Aug 2026), and a whole stack goes into one give with no cap seen up to 1000.
+            perPoint = 2,
+            vendor = "A Vendor of Reagents", vendorZone = "guildlobby", vendorWhere = "Guild Lobby",
+            npc = "Lashun Novashine", npcZone = "qeynos2", npcZoneName = "North Qeynos",
+            npcWhere = "North Qeynos - walks a route",
+            raises = "Priests of Life, Knights of Thunder, Guards of Qeynos", lowers = "Bloodsabers",
+            -- Antonius Bayle's race adjustments, from the game's own faction tables: these four and no
+            -- others, and no class or deity ones. Used only for the up-front estimate.
+            adjust = { race = { ["Dark Elf"] = -200, Troll = -375, Ogre = -375, Iksar = -375 } },
+            -- Read before a run. At Threatening or Scowls the guards between you and the NPC attack on
+            -- sight - and for an Iksar or a Troll the game starts Guards of Qeynos at -1000.
+            danger = "Guards of Qeynos",
+            -- The faction the NPC himself answers to - read before a run, because at Threatening or Scowls
+            -- he attacks on sight and cannot be handed anything openly. Priests of Life, confirmed from his
+            -- con (faction id 341) on 2026-09-27, the day he killed a level 1 Iksar that walked up to him.
+            npcFaction = "Priests of Life",
+            -- WHERE TO MEET HIM when those guards are hostile (v2.33, AL's plan - it killed a level 1 Iksar
+            -- that walked straight to him). Lashun's route takes him out of the city's NORTH gate - where the
+            -- gate guards stand - to the open field north-west of the city: AL's August loc, 1074.56, 450.15,
+            -- "wanders within roughly a 200-radius". The PoK book stands just OUTSIDE the city's west wall,
+            -- and from it the navmesh walks to that field in one straight line across open ground, never
+            -- entering the city. So: arrive by the book, wait there, and walk out only while he is in the field.
+            -- The book's spot is AL's own loc standing at it in game, 356, 460 (v2.35). The map file's label
+            -- for it (183, 484) is 175 off - the maps date from 2016 - and 2.33/2.34 measured "at the book"
+            -- from that label, so a character standing at the real book was told it was not.
+            -- THE MEETING LINE (v2.40): Lashun's route does NOT reach the August spot - he stops at 508.87,
+            -- 103.00 (heading 360), just north of the north gate by the stream, seen twice on 2026-09-27. AL:
+            -- "he stops here clear past the gate guards... anything here or farther is ok." So he counts as out
+            -- once he is at Y 500 or more - past the gate, on the field side; the August spot is inside that
+            -- too. 2.33-2.39 waited for a circle round the August spot, which his route never entered.
+            meet = { waitY = 356, waitX = 460, minY = 500 },
+        },
+        {
+            -- v2.58 - A COIN HELPER: no shop, no items - `coin` and `perGive` instead of `item` and a vendor.
+            -- Fabian's Strings, step 1: 2 gold = League of Antonican Bards +2. The quest wants that faction at
+            -- Indifferent, but a hostile NPC reads a SNEAKING character as Indifferent and his quest believes it
+            -- (AL, in game, 2026-09-28: from Fabian's back, Hide off, Sneak on, a level 10 Iksar at Scowls). Then
+            -- ~1,080 gives took Xanley from Scowls to Ally in an afternoon, and the gain landed on the character.
+            -- EXACTLY 2 gold a trade - he hands back anything else (80), so one trade is one turn-in.
+            key = "fabian", title = "Fabian's Strings", faction = "League of Antonican Bards",
+            neededFor = "Every bard in the Postmaster's Challenge - Tralyn and Eve Marsinger attack at Threatening or Scowls.",
+            coin = "Gold", perGive = 2, unit = "gold",
+            perPoint = 1,   -- gold per point: 2 gold, +2
+            goal = "Indifferent",
+            npc = "Fabian", npcZone = "freeporteast", npcZoneName = "East Freeport",
+            npcWhere = "East Freeport - the Grub 'n Grog",
+            raises = "Knights of Truth, Guards of Qeynos", lowers = "Ring of Scale, Mayong Mistmoore",
+            -- The bards' adjustments, from the game's own faction tables (faction 284) - race, class AND deity,
+            -- unlike Antonius Bayle. Xanley: Iksar -600, Shadow Knight -25, Cazic-Thule -200 = -825, his window
+            -- to the point. Names as MQ gives them (Me.Race, Me.Class.Name, Me.Deity); Guktan = Froglok, and the
+            -- game's Fizzlethorp is MQ's Bristlebane - both spellings kept.
+            adjust = {
+                race = { Human = 50, Barbarian = -25, ["Wood Elf"] = 25, ["Dark Elf"] = -50, ["Half Elf"] = 50,
+                    Dwarf = -25, Troll = -600, Ogre = -550, Iksar = -600, ["Vah Shir"] = -25, Froglok = 50,
+                    Guktan = 50, Drakkin = 50 },
+                class = { ["Shadow Knight"] = -25, Bard = 100, Rogue = 25, Necromancer = -25 },
+                deity = { Bertoxxulous = -200, ["Cazic-Thule"] = -200, ["Erollisi Marr"] = 50, Fizzlethorp = 50,
+                    Bristlebane = 50, Innoruuk = -200, Karana = 50, Prexus = 50, ["Rallos Zek"] = -25, Tunare = 50,
+                    Veeshan = -50 },
+            },
+            -- The guards all round him (AL, as himself, 2026-09-28: Runthar and Guard Tival Threatening while
+            -- Fabian said Ally). Hostile → the mask is needed even at bards Ally.
+            danger = "The Freeport Militia",
+        },
+        {
+            -- v2.59 - LADY SHAE'S WINE: the Bone Chips shape again - buy, one trade of up to four stacks. Her part of
+            -- "The Bayle List": 4 Red Wine = Emerald Warriors +5, and Emerald Warriors ARE Kelethin's guards (23 of
+            -- them). She was "changed due to exploits" (AL), so it was measured before building on it (luatools/
+            -- itemgive, 2026-09-29): 8 Red Wine as ONE pile, one trade → +10 in two lines, nothing handed back - a
+            -- stack still counts per 4. Red, not White: White pays +1 a bottle (Red +1.25) and was only seen singly.
+            key = "shaewine", title = "Lady Shae's Wine", faction = "Emerald Warriors",
+            neededFor = "Kelethin's guards - on the way to Jakum Webdancer and Idia (Kelethin mail), and Idia's pickup.",
+            item = "Red Wine",
+            perPoint = 0.8, perSet = 4,   -- 4 bottles = +5; always whole sets of 4
+            goal = "Indifferent",
+            goalTip = "The reaction to stop at. At Dubious Kelethin's guards stop attacking\non sight;"
+                .. " Indifferent (the default) leaves a margin.\n\nOne trade carries up to four stacks, and the wine is"
+                .. " cheap -\nthe estimate never plans past the +2,000 earned standing.",
+            vendor = "Brewmaster Berina", vendorZone = zones.pokShort, vendorWhere = "Plane of Knowledge",
+            npc = "Lady Shae", npcZone = "freeportwest", npcZoneName = "West Freeport",
+            npcWhere = "West Freeport - the Hogcaller's Inn",
+            raises = "Kelethin Merchants, Merchants of Felwithe", lowers = "Indigo Brotherhood",
+            -- Faction 326's adjustments from the game's own tables. Xanley: Iksar -1000, Shadow Knight -200,
+            -- Cazic-Thule -200 = -1400; AL's hover "650 points to Threatening" agrees.
+            adjust = {
+                race = { Human = -50, Barbarian = -50, Erudite = -50, ["Wood Elf"] = 50, ["High Elf"] = 50,
+                    ["Dark Elf"] = -750, ["Half Elf"] = 50, Dwarf = -50, Troll = -750, Ogre = -750, Halfling = -10,
+                    Gnome = -25, Iksar = -1000, ["Vah Shir"] = -50, Froglok = -50, Guktan = -50, Drakkin = -50 },
+                class = { Warrior = 50, ["Shadow Knight"] = -200, Necromancer = -200 },
+                deity = { Bertoxxulous = -200, ["Brell Serilis"] = -50, ["Cazic-Thule"] = -200, Fizzlethorp = -25,
+                    Bristlebane = -25, Innoruuk = -200, ["Solusek Ro"] = -50, Tunare = 50, Veeshan = -50 },
+            },
+            -- Lady Shae herself only glowers (Dubious to Xanley, visible) - the danger is the Militia round her inn:
+            -- Guard Raflin walked up to a sneaking Xanley after a trade and killed him (AL, 2026-09-28).
+            danger = "The Freeport Militia",
+        },
+        {
+            -- v2.60 - PALATOS'S ALE: MANY trades like Fabian, but ITEMS, bought IN PLACE (`loop`). Allakhazam 384
+            -- "The Painting": 4 Capt. Orlin's Spiced Ale = High Guard of Erudin +1 - Erudin's gate guards, the level 50
+            -- Sentinels in Toxxulia that killed Xanley. Only 4 count per trade whatever the stack, and he hands back a
+            -- LORE Beacon Mount, landing in the bags, that blocks the next turn-in until destroyed. AL ran it by hand
+            -- and with luatools/itemgive (2026-09-29): 25 turn-ins, 3.3 s each, 25 beacons destroyed, nothing back.
+            -- The ale runs out fast (500 turn-ins = 2,000 ale), so it is bought from the bartender beside him.
+            key = "palatos", title = "Palatos's Ale", faction = "High Guard of Erudin",
+            neededFor = "Erudin's guards - the Toxxulia Forest gate Sentinels (level 50) on the way to Ticar Lorestring.",
+            item = "Capt. Orlin's Spiced Ale", loop = true,
+            perTrade = 4, perPoint = 4, perSet = 4,   -- 4 ale = +1, one set a trade
+            destroy = "Beacon Mount",
+            goal = "Dubious",
+            goalTip = "The reaction to stop at. At Dubious the gate guards in Toxxulia and\nErudin stop attacking on"
+                .. " sight - the default.\n\nIt is slow: +1 for every 4 ale, one trade each. The ale is bought\nfrom"
+                .. " the bartender beside him as you go.",
+            -- The ale is bought from `shop`, beside him - AL: from his back, Nesin's shop opens without a step.
+            -- Berina (PoK) sells it too - shown on the tab only; since v2.64 nothing walks there.
+            vendor = "Brewmaster Berina", vendorZone = zones.pokShort, vendorWhere = "Plane of Knowledge",
+            shop = "Nesin Tapper",
+            npc = "Palatos Kynarn", npcZone = "freeporteast", npcZoneName = "East Freeport",
+            npcWhere = "East Freeport - the Chops 'n Hops, in the slums (no Militia patrols there)",
+            spot = { y = -1257.55, x = 377.01, z = -51.81 },   -- AL's spot behind him, heading NNE
+            raises = "Craftkeepers, High Council of Erudin", lowers = "Heretics",
+            -- Faction 267's adjustments from the game's own tables. Xanley: Iksar -725, Shadow Knight -200,
+            -- Cazic-Thule -100 = -1025.
+            adjust = {
+                race = { Human = -25, Barbarian = -50, Erudite = 50, ["Wood Elf"] = -25, ["High Elf"] = -25,
+                    ["Dark Elf"] = -500, ["Half Elf"] = -25, Dwarf = -200, Troll = -625, Ogre = -625, Halfling = -50,
+                    Gnome = -25, Iksar = -725, ["Vah Shir"] = -50, Froglok = -25, Guktan = -25, Drakkin = -25 },
+                class = { ["Shadow Knight"] = -200, Rogue = -50, Necromancer = -200 },
+                deity = { Bertoxxulous = -100, ["Cazic-Thule"] = -100, Innoruuk = -200 },
+            },
+            -- His own faction: Craftkeepers (Allakhazam npc 881 - killing him costs it 20). Deep Scowls to Xanley.
+            npcFaction = "Craftkeepers",
+            -- IN THE ROOM with him: Canlan Talespinner, League of Antonican Bards (Allakhazam npc 870). Hostile, he is
+            -- close enough to see through Sneak - so this helper waits for Fabian's Strings instead of masking (AL).
+            danger = "League of Antonican Bards", dangerNpc = "Canlan Talespinner", dangerFix = "Fabian's Strings",
+        },
+    },
+    request = nil,   -- helper index the Run button asked for; the main loop runs it
+    check = nil,     -- helper index the Check button asked to re-read
+    unshroud = nil,  -- helper index the Unshroud button asked for (v2.41)
+    -- v2.63: the coin/loop run in progress - { key, need = what is LEFT, word, danger, npcWord } - sized as yourself,
+    -- so a Run pressed in a SHROUD (where the Faction window is empty) carries on with it. Memory only.
+    plan = nil,
+    active = nil,    -- helper index running right now
+    last = nil,      -- helper index the status line belongs to
+    status = "",
+    given = 0,       -- items handed over this run
+    banked = 0,      -- items put in the bank for the shroud to take back out (v2.41)
+    empty = false,   -- the last read found the Faction window's list EMPTY - a shroud does that (v2.41)
+    reads = {},      -- [key] = { word =, standing =, danger = } - the last reading, for the tab
+    -- The con message for every tier, exactly as the client's own string file has them (eqstr_us.txt, ids
+    -- 12212-12220). A con is the one faction read that still works in a shroud (v2.41).
+    conPhrases = {
+        { "regards you as an ally", "Ally" }, { "looks upon you warmly", "Warmly" },
+        { "kindly considers you", "Kindly" }, { "judges you amiably", "Amiably" },
+        { "regards you indifferently", "Indifferent" }, { "looks your way apprehensively", "Apprehensive" },
+        { "glowers at you dubiously", "Dubious" }, { "glares at you threateningly", "Threatening" },
+        { "scowls at you, ready to attack", "Scowls" },
+    },
+    -- The PoK banker right beside Shroudkeeper Hyush (AL, 2026-09-27: loc 458.00, 474.00, -124.18). The bank
+    -- is the bridge for ITEMS between a character and their shroud: a shroud cannot reach the normal self's bags,
+    -- nor the SHARED bank, but it CAN reach the personal bank (AL, in game, shrouded as a Goblin Rogue with 14 free
+    -- slots). COINS need no bridge: a PoK monster shroud KEEPS the coins you carry (AL, 2026-09-29 - the game
+    -- changed this; long ago money had to be banked too, and mission shrouds are different).
+    banker = "Banker Ceridan",
+    -- The money slots, IW_Money0-3 in the purse and BNK_Money0-3 in the bank (the game's own EQUI_Inventory.xml
+    -- and EQUI_BigBankWnd.xml), by the metal's name as MQ spells it (Me.Gold, Me.CursorGold...). v2.58.
+    moneySlot = { Platinum = 0, Gold = 1, Silver = 2, Copper = 3 },
+}
+
+function faction.rank(word)
+    for i, w in ipairs(faction.tiers) do
+        if w == word then return i end
+    end
+    return nil
+end
+
+function faction.hostile(word)
+    return word == "Threatening" or word == "Scowls"
+end
+
+function faction.coin(copper)
+    copper = math.floor(copper or 0)
+    return string.format("%dp %dg %ds %dc", math.floor(copper / 1000), math.floor(copper / 100) % 10,
+        math.floor(copper / 10) % 10, copper % 10)
+end
+
+-- One faction's Reaction word and earned standing, off the Faction window. Tries with the window as it is
+-- first; only if that comes back empty does it open the window, and it shuts it again afterwards, so the
+-- player's screen is left as it was.
+-- A SHROUD EMPTIES THE LIST (AL, in game, 2026-09-27, five rounds of tests): the window opens with nothing
+-- in it while shrouded, and it STAYS empty after the shroud is removed, until the player camps to character
+-- select and comes back - /reloadui does not cure it, and nor does opening it this way. So `faction.empty`
+-- records whether the list held nothing even after this function opened the window itself and waited.
+-- It must never be judged cold: straight after a login the list also holds nothing until the window is
+-- first opened, and this very open is what fills it then.
+-- v2.41: a window found OPEN but empty is closed and opened again this way before giving up - once, after a
+-- camp, EQ's own /faction showed it empty while this route read it fine.
+function faction.read(name)
+    local wnd = mq.TLO.Window('FactionWnd')
+    local list = mq.TLO.Window('FactionWnd/FAC_FactionList')
+    local word, standing = nil, nil
+    local function readRow()
+        local row = list.List('=' .. name, 1)() or 0
+        if row == 0 then return false end
+        word = list.List(row, 2)()
+        if word == "" then word = nil end
+        standing = tonumber((list.List(row, 3).Tooltip() or ""):match("Standing:%s*(-?%d+)"))
+        return word ~= nil
+    end
+    faction.empty = false
+    if not readRow() then
+        local wasOpen = wnd.Open()
+        if wasOpen then
+            wnd.DoClose()
+            mq.delay(200)
+        end
+        wnd.DoOpen()
+        waitUntil(readRow, 3000, 200)
+        faction.empty = (list.Items() or 0) == 0
+        if not wasOpen then wnd.DoClose() end
+    end
+    return word, standing
+end
+
+-- What to tell the player when the list read empty - the cure depends on whether they are still shrouded.
+function faction.emptyWhy()
+    if mq.TLO.Me.Shrouded() then
+        return "your Faction window is empty because you are shrouded - press Unshroud, then camp to character"
+            .. " select and come back (EQ keeps it empty after a shroud until you do)"
+    end
+    return "your Faction window is empty - EQ leaves it that way after a shroud until you camp to character"
+        .. " select and come back. Camp, come back, then try again"
+end
+
+-- The tier a con message names, from the game's own phrases (see conPhrases above), or nil.
+function faction.conTier(text)
+    for _, p in ipairs(faction.conPhrases) do
+        if text and text:find(p[1], 1, true) then return p[2] end
+    end
+    return nil
+end
+
+function faction.refresh(h)
+    local word, standing = faction.read(h.faction)
+    local danger, npcWord = nil, nil
+    if not faction.empty then   -- an empty list is empty for all three - no need to wait on it twice more
+        danger = h.danger and faction.read(h.danger) or nil
+        npcWord = h.npcFaction and faction.read(h.npcFaction) or nil
+    end
+    faction.reads[h.key] = { word = word, standing = standing, danger = danger, npcWord = npcWord }
+    return word, standing, danger, npcWord
+end
+
+-- This character's race + class + deity adjustment for the helper's faction (v2.58 - Bone Chips needed race
+-- only). Read as yourself: in a shroud, Me.Class and Me.Race report the monster.
+function faction.adjustFor(h)
+    local a = h.adjust
+    return (a.race and a.race[myRace] or 0) + (a.class and a.class[mq.TLO.Me.Class.Name() or ""] or 0)
+        + (a.deity and a.deity[tostring(mq.TLO.Me.Deity() or "")] or 0)
+end
+
+-- Takes what just landed off the run in progress (v2.63) - see `faction.plan`.
+function faction.planGave(h, n)
+    local p = faction.plan
+    if p and p.key == h.key then p.need = math.max(0, p.need - n) end
+end
+
+-- The Stop at for one helper (v2.58: each keeps its own). An older save's single goal stays with Bone Chips.
+function faction.goalFor(h)
+    return state.factionGoals[h.key] or h.goal or state.factionGoal
+end
+
+-- Items (or gold) still needed to reach `goal`, or nil when the standing did not read. The Reaction the goal
+-- is measured in = earned standing + this character's adjustments (see the table above). v2.58: never more
+-- than the EARNED standing can still climb - it stops at +2,000, and Xanley's last ~80 gives past it earned
+-- nothing. So a goal the cap cannot reach returns 0 while the word is still below it.
+function faction.estimate(h, standing, goal)
+    if not standing then return nil end
+    local short = math.min(faction.starts[goal] - (standing + faction.adjustFor(h)), 2000 - standing)
+    if short <= 0 then return 0 end
+    -- v2.59: whole items, and whole sets where the NPC counts in sets (Lady Shae: 4 wine = +5, perPoint 0.8).
+    local n = math.ceil(short * h.perPoint)
+    if h.perSet then n = math.ceil(n / h.perSet) * h.perSet end
+    return n
+end
+
+function faction.count(h)
+    return mq.TLO.FindItemCount('=' .. h.item)() or 0
+end
+
+-- How many sit LOOSE in the personal bank slots (bank1..24) - the ones faction.withdraw can take out. Not
+-- the shared bank (a shroud cannot reach it), and not inside bags in the bank. Stack = items in a stack.
+function faction.bankCount(h)
+    local n = 0
+    for i = 1, 24 do
+        local it = mq.TLO.Me.Bank(i)
+        if it.Name() == h.item then n = n + (it.Stack() or 1) end
+    end
+    return n
+end
+
+-- One line saying what is on hand against what the goal needs, BEFORE any buying (v2.39, AL: *"Script did
+-- not say if it checked his inv for if he has any on him or needs xxx more"*). Returns the shortfall.
+function faction.stockLine(h, want, goal)
+    local carried, banked = faction.count(h), faction.bankCount(h)
+    local short = math.max(want - carried - banked, 0)
+    print(string.format('\ay[Postmaster]\ax %s: %d on you, %d in your bank - about %d wanted for %s. %s', h.item,
+        carried, banked, want, goal, short > 0 and string.format("Buying %d.", short)
+            or (carried >= want and "Enough on you - nothing to buy." or "Enough with the bank - nothing to buy.")))
+    return short
+end
+
+-- The bank, for moving items between a character and their shroud (v2.38). Personal slots only: bank1..24
+-- (MQ's own names, BNK_BankSlot0-23 in the game's window; 24 on Live - MQ's GetAvailableBankSlots gives 24
+-- with the PoR expansion). Never the shared bank - the shroud cannot reach it.
+function faction.openBank()
+    if mq.TLO.Window('BigBankWnd').Open() then return true end
+    if not travelToZone(zones.pokShort, faction.banker) then return false end
+    if not navToNpc(faction.banker) then return false end
+    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. faction.banker).ID() or 0)
+    mq.delay(300)
+    mq.cmd('/click right target')
+    return waitUntil(function() return mq.TLO.Window('BigBankWnd').Open() == true end, 10000, 250)
+end
+
+function faction.closeBank()
+    if mq.TLO.Window('BigBankWnd').Open() then mq.cmd('/notify BigBankWnd BNK_DoneButton leftmouseup') end
+    waitUntil(function() return not mq.TLO.Window('BigBankWnd').Open() end, 3000, 200)
+end
+
+-- Every stack carried goes into an empty personal bank slot. Counted by the stacks LEAVING the bags.
+function faction.deposit(h)
+    local before = faction.count(h)
+    while faction.count(h) > 0 and running and not automation.stop do
+        local slot = 0
+        for n = 1, 24 do
+            if (mq.TLO.Me.Bank(n).ID() or 0) == 0 then slot = n; break end
+        end
+        if slot == 0 then
+            print('\ar[Postmaster]\ax your bank has no empty slot left for the ' .. h.item .. '.')
+            break
+        end
+        local carried = faction.count(h)
+        mq.cmdf('/shift /itemnotify "%s" leftmouseup', h.item)
+        if not waitUntil(function() return mq.TLO.Cursor.Name() == h.item end, 3000, 100) then break end
+        mq.cmdf('/itemnotify bank%d leftmouseup', slot)
+        if not waitUntil(function() return (mq.TLO.Cursor.ID() or 0) == 0 end, 3000, 100) then
+            mq.cmd('/autoinventory')   -- never strand a stack on the cursor
+            break
+        end
+        -- The bags must actually have gone down, or this would loop forever - e.g. if the pickup ever took a
+        -- stack from the open bank instead of the bags and put it straight back.
+        if faction.count(h) >= carried then break end
+    end
+    return before - faction.count(h)
+end
+
+-- Stacks from the personal bank come out into the bags (the shroud's, once shrouded) - every one, or with
+-- `upTo`, whole stacks until at least that many have come out. Counted by the stacks ARRIVING.
+function faction.withdraw(h, upTo)
+    local before = faction.count(h)
+    dbg(string.format('withdraw: %d free bag slots, taking up to %s %s', mq.TLO.Me.FreeInventory() or 0,
+        tostring(upTo or "all"), h.item))
+    for n = 1, 24 do
+        if not running or automation.stop then break end
+        if upTo and faction.count(h) - before >= upTo then break end
+        if mq.TLO.Me.Bank(n).Name() == h.item then
+            if (mq.TLO.Me.FreeInventory() or 0) < 1 then
+                print('\ay[Postmaster]\ax bags full - leaving the rest of the ' .. h.item .. ' in the bank.')
+                break
+            end
+            mq.cmdf('/shift /itemnotify bank%d leftmouseup', n)
+            if waitUntil(function() return mq.TLO.Cursor.Name() == h.item end, 3000, 100) then
+                -- v2.42: a stack must LAND in the bags before the next is touched. On 2.41's first run (AL, a
+                -- fresh Goblin Rogue shroud) the second stack stayed on the cursor, the next bank click
+                -- swapped it for the third, and the run walked off holding one. Try a few times; if it still
+                -- will not go in, put it back in the slot it came from and take no more.
+                for _ = 1, 3 do
+                    mq.cmd('/autoinventory')
+                    if waitUntil(function() return (mq.TLO.Cursor.ID() or 0) == 0 end, 2000, 100) then break end
+                end
+                dbg(string.format('bank%d: cursor now %s, %d free bag slots', n, tostring(mq.TLO.Cursor.Name()),
+                    mq.TLO.Me.FreeInventory() or 0))
+                if (mq.TLO.Cursor.ID() or 0) > 0 then
+                    mq.cmdf('/itemnotify bank%d leftmouseup', n)
+                    waitUntil(function() return (mq.TLO.Cursor.ID() or 0) == 0 end, 3000, 100)
+                    print(string.format('\ay[Postmaster]\ax a stack of %s would not go into your bags (%d free slots'
+                        .. ' showing) - left it in the bank.', h.item, mq.TLO.Me.FreeInventory() or 0))
+                    break
+                end
+            end
+        end
+    end
+    return faction.count(h) - before
+end
+
+-- Buy as yourself, bank, shroud, and take the items back out as the shroud (v2.38, AL: *"all items on self
+-- are inaccessible while shrouded"*). Returns true with the items in the shroud's bags, or false and why.
+-- v2.41 (AL): `want` is the WHOLE amount for the Stop at goal - there is one trip, because nothing can be
+-- bought or read once shrouded - and the number banked for it is remembered (`faction.banked`), so the
+-- shroud takes back exactly that, not every stack that happens to be in the bank.
+function faction.bankAndShroud(h, want, goal)
+    automation.noShroud = true   -- travel must not shroud us before the buying and banking
+    -- Counts the bags AND the bank first (v2.39): chips already banked are exactly what the shroud needs.
+    local short = faction.stockLine(h, want, goal)
+    if short > 0 then
+        faction.status = string.format("Buying %d %s as yourself, before the shroud...", short, h.item)
+        faction.buy(h, short)
+    end
+    if faction.count(h) + faction.bankCount(h) == 0 then
+        automation.noShroud = false
+        return false, "could not buy " .. h.item
+    end
+    if faction.count(h) > 0 then
+        faction.status = string.format("Banking the %s before the shroud...", h.item)
+        local banked = faction.openBank() and faction.deposit(h) or 0
+        faction.closeBank()
+        if banked > 0 then
+            print(string.format('\ag[Postmaster]\ax banked %d %s.', banked, h.item))
+        end
+        if faction.count(h) > 0 then
+            print(string.format('\ay[Postmaster]\ax %d %s could not be banked - they stay with you, out of the'
+                .. ' shroud\'s reach.', faction.count(h), h.item))
+        end
+    end
+    automation.noShroud = false
+    if faction.bankCount(h) == 0 then return false, "could not bank the " .. h.item .. " - the shroud could not reach them" end
+    faction.banked = math.min(faction.bankCount(h), want)
+    print(string.format('\ay[Postmaster]\ax %d %s in your bank for this run%s - the shroud takes them back out next.',
+        faction.banked, h.item, faction.banked < want and string.format(" (short of the %d wanted - going with those)", want) or ""))
+
+    ensureShroud(true)
+    if not mq.TLO.Me.Shrouded() then return false, "could not take the Goblin Rogue shroud" end
+
+    faction.status = string.format("Taking %d %s back out of the bank as the shroud...", faction.banked, h.item)
+    local got = faction.openBank() and faction.withdraw(h, faction.banked) or 0
+    -- Never walk away from the bank holding a stack (2.41 did). withdraw puts a stuck one back; if even
+    -- that failed, stop here rather than carry it to North Qeynos.
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        faction.closeBank()
+        return false, string.format("a stack of %s is stuck on your cursor - put it away (bank or bags)", h.item)
+    end
+    faction.closeBank()
+    if got == 0 then return false, "could not take the " .. h.item .. " back out of the bank" end
+    print(string.format('\ag[Postmaster]\ax the shroud is carrying %d %s%s.', got, h.item, got < faction.banked
+        and string.format(" - %d fewer than the %d banked for this run", faction.banked - got, faction.banked) or ""))
+    return true
+end
+
+-- Buys up to `want`, in as many stacks as that takes (one bag slot each), and returns how many actually
+-- arrived. The fleet's proven merchant sequence (turnipbuy, pppoker): select by exact name, Buy at most one
+-- stack at a time, and confirm by the count going up - never by the click. The PRICE and the STACK SIZE are
+-- both read off the merchant, never assumed: price varies with charisma and faction, and the stack size is
+-- whatever this server says it is.
+-- v2.32: WAITS FOR THE MERCHANT'S LIST before selecting. v2.29 selected 600 ms after the window opened; a
+-- big shop like a reagent vendor had not sent its list yet, so SelectItem found nothing and the run said
+-- "does not sell Bone Chips" at a vendor that does (AL, level 1 Iksar). Merchant.ItemsReceived is MQ's own
+-- "the list has been filled in" flag.
+function faction.buy(h, want)
+    if not checkInventorySpace(1, h.item) then return 0 end
+    if not travelToZone(h.vendorZone, h.vendor) then return 0 end
+    if not navToNpc(h.vendor) then return 0 end
+    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. h.vendor).ID() or 0)
+    mq.delay(300)
+    mq.cmd('/click right target')
+    if not waitUntil(function() return mq.TLO.Merchant.Open() == true end, 10000, 300) then
+        printIfRunning('\ar[Postmaster]\ax ' .. h.vendor .. '\'s shop did not open.')
+        return 0
+    end
+    waitUntil(function() return mq.TLO.Merchant.ItemsReceived() == true end, 10000, 250)
+    mq.cmd('/notify MerchantWnd MW_MerchantSubwindows tabselect 1')
+    mq.delay(300)
+    -- A few tries: a miss costs a second here, where giving up costs the whole trip.
+    for _ = 1, 3 do
+        mq.TLO.Merchant.SelectItem('=' .. h.item)()
+        if waitUntil(function() return mq.TLO.Merchant.SelectedItem.Name() == h.item end, 1500, 250) then break end
+    end
+    local bought = 0
+    if mq.TLO.Merchant.SelectedItem.Name() ~= h.item then
+        print('\ar[Postmaster]\ax could not find ' .. h.item .. ' in ' .. h.vendor .. '\'s list.')
+    else
+        local price = mq.TLO.Merchant.SelectedItem.BuyPrice() or 0
+        local stack = math.max(mq.TLO.Merchant.SelectedItem.StackSize() or 1, 1)
+        local total = want
+        if price > 0 then total = math.min(total, math.floor((mq.TLO.Me.Cash() or 0) / price)) end
+        if total < 1 then
+            print(string.format('\ar[Postmaster]\ax not enough money for %s - they cost %s each here.', h.item, faction.coin(price)))
+        end
+        local before = faction.count(h)
+        while bought < total and running and not automation.stop do
+            if (mq.TLO.Me.FreeInventory() or 0) < 1 then
+                print(string.format('\ay[Postmaster]\ax bags full after %d %s - carrying on with those.', bought, h.item))
+                break
+            end
+            local batch = math.min(stack, total - bought)
+            mq.TLO.Merchant.Buy(batch)()
+            waitUntil(function() return faction.count(h) >= before + bought + batch end, 8000, 250)
+            local now = faction.count(h) - before
+            if now <= bought then break end   -- nothing arrived: stop rather than keep spending blind
+            bought = now
+        end
+        if bought > 0 then
+            print(string.format('\ag[Postmaster]\ax bought %d %s for %s (stacks of %d here).', bought, h.item,
+                faction.coin(bought * price), stack))
+        end
+    end
+    mq.cmd('/notify MerchantWnd MW_Done_Button leftmouseup')
+    mq.delay(300)
+    return bought
+end
+
+-- Safe-meeting helpers (v2.33) - see the `meet` field above for the why.
+function faction.distTo(y, x)
+    local dy, dx = (mq.TLO.Me.Y() or 0) - y, (mq.TLO.Me.X() or 0) - x
+    return math.sqrt(dy * dy + dx * dx)
+end
+
+function faction.inMeetArea(h)
+    local sp = mq.TLO.Spawn("npc " .. h.npc)
+    if (sp.ID() or 0) == 0 then return false end
+    return (sp.Y() or 0) >= h.meet.minY
+end
+
+-- Walk back to the waiting spot (no-op when already there). The way back is the same west-side field.
+function faction.backToWait(h)
+    if faction.distTo(h.meet.waitY, h.meet.waitX) <= 15 then return true end
+    mq.cmdf('/nav locyx %.2f %.2f log=off', h.meet.waitY, h.meet.waitX)
+    waitUntil(function() return mq.TLO.Navigation.Active() == true end, 3000, 100)
+    return waitUntil(function()
+        return faction.distTo(h.meet.waitY, h.meet.waitX) <= 15 or not mq.TLO.Navigation.Active()
+    end, 120000, 250)
+end
+
+-- Stand at the waiting spot until he is out in the field. Shaped like the bards' stage wait in Sunrise
+-- Hills, on purpose (v2.34, AL): one line to say why we are waiting, a heartbeat every 5 minutes so a long
+-- wait never reads as a hang, one line when he shows, and the same generous 45-minute ceiling - his route
+-- has no known timing. The tab's status line counts the minutes too; Pause and Stop work throughout.
+function faction.waitForMeet(h)
+    if faction.inMeetArea(h) then return true end
+    local since = mq.gettime()
+    local nextNudge = since + 300000
+    print(string.format('\ay[Postmaster]\ax Waiting safely by the PoK book since you are KOS here, until %s comes out of the gates.', h.npc))
+    local came = waitUntil(function()
+        local mins = math.floor((mq.gettime() - since) / 60000)
+        faction.status = string.format("Waiting safely by the PoK book for %s to come out of the gates (%d min)...", h.npc, mins)
+        if mq.gettime() >= nextNudge then
+            nextNudge = mq.gettime() + 300000
+            print(string.format('\ay[Postmaster]\ax still waiting on %s - %d minutes so far. Nothing is stuck; they are still inside the gates.',
+                h.npc, mins))
+        end
+        return faction.inMeetArea(h)
+    end, 2700000, 1000)
+    if came then
+        print(string.format('\ag[Postmaster]\ax %s is out past the gates after %d minutes - heading out to meet them.',
+            h.npc, math.floor((mq.gettime() - since) / 60000)))
+    end
+    return came
+end
+
+-- Hands over EVERY stack carried, one trade each, in ONE visit (v2.32 - before, one stack per round meant a
+-- fresh walk to him for each). Counted, not assumed: a trade only counts if the items actually left the
+-- bags, because an NPC that refuses one hands them back. He walks a route, so a trade that misses him is
+-- tried again from wherever he is by then; three misses in a row ends the visit. Returns true if at least
+-- one trade landed.
+-- `careful` (v2.33): the guards on the way are hostile, so meet him only out in the field - arrive by the
+-- PoK book, wait there, walk out while he is in the field, and walk back to the book afterwards.
+-- `stealthGive` (v2.37): he himself is hostile, so the trade happens while shrouded and hidden - approach with
+-- Sneak+Hide and never unhide or /makemevisible for it (see approachAndInteract's keepHidden).
+-- v2.41 (AL's design): shrouded, there is no waiting at the book - straight to him wherever he is, Sneak+Hide
+-- on from the moment we arrive (we already KNOW this city is hostile, so it does not wait for the Radius
+-- Watch scan to find a guard first). The give itself breaks Hide, and the first stack should end the danger
+-- anyway, so each stack after it just goes over. After every stack he is conned: the Faction window is
+-- empty in a shroud, but a con still reads, and it says whether he is still hostile.
+function faction.give(h, careful, stealthGive)
+    local m = careful and h.meet
+    -- Careful mode goes THROUGH PoK (v2.34): PoK's book is what lands you by the PoK book here, outside the
+    -- wall. Any other way in can land inside the city - it did, twice, on 2026-09-27, after a respawn.
+    -- (Shroudkeeper Hyush is just a PoK spawn to confirm arrival by; getGoblinRogueShroud uses him too.)
+    local here = mq.TLO.Zone.ShortName() or ""
+    if m and here ~= h.npcZone and here ~= zones.pokShort then
+        if not travelToZone(zones.pokShort, "Shroudkeeper Hyush") then return false end
+    end
+    if not travelToZone(h.npcZone, h.npc) then return false end
+    if stealthGive then
+        -- Latch Radius Watch for this zone FIRST, so it neither resets on a "zone change" nor scans and changes
+        -- the abilities behind setStealth's back. Then Sneak and Hide CONFIRMED, five tries, standing still
+        -- (v2.44 - 2.43 pressed them unchecked and level 10 Xanley died walking into North Qeynos).
+        radiusWatchZoneId = mq.TLO.Zone.ID() or 0
+        radiusWatchLatched = true
+        radiusWatchKnownHostileZones[radiusWatchZoneId] = true
+        if not setStealth(true, 5) then
+            if running and not automation.stop and not mq.TLO.Me.Hovering() then
+                print(string.format('\ar[Postmaster]\ax could not get sneaking and hidden where you arrived in %s after'
+                    .. ' 5 tries - a level %d Goblin Rogue\'s Hide and Sneak fail often. Not walking in visible.',
+                    h.npcZoneName, mq.TLO.Me.Level() or 0))
+            end
+            return false
+        end
+        print('\ag[Postmaster]\ax sneaking and hidden - going to ' .. h.npc .. '.')
+    end
+    if m and faction.distTo(m.waitY, m.waitX) > 150 then   -- 150: a landing spot varies a little
+        -- The route still came in somewhere else. Walking from there could go straight through the city,
+        -- past the very guards this mode exists to avoid - stop, and let the player move. The loc is printed
+        -- so a miss teaches us where the route really came in.
+        print(string.format('\ar[Postmaster]\ax arrived in %s %d away from the PoK book (you are at %.0f, %.0f) -'
+            .. ' not walking through the city past the guards. Get to the book, then Run again.', h.npcZoneName,
+            math.floor(faction.distTo(m.waitY, m.waitX)), mq.TLO.Me.Y() or 0, mq.TLO.Me.X() or 0))
+        return false
+    end
+    local landed, misses = false, 0
+    while faction.count(h) > 0 and misses < 3 do
+        if automation.stop or not running or mq.TLO.Me.Hovering() then break end
+        if m and not faction.inMeetArea(h) then
+            faction.backToWait(h)
+            if not faction.waitForMeet(h) then
+                if running and not automation.stop and not mq.TLO.Me.Hovering() then
+                    print('\ar[Postmaster]\ax gave up waiting for ' .. h.npc .. ' to come out of the gates after 45 minutes.'
+                        .. ' Nothing was lost - Run again later.')
+                end
+                break
+            end
+            faction.status = string.format("Taking %s to %s...", h.item, h.npc)
+        end
+        local before = faction.count(h)
+        -- Up to four stacks in ONE trade (v2.43, AL: *"It should be a very fast inv pickup and turn in"*). One
+        -- stack per trade meant a fresh approach per stack, and a run that gave a 250 stack - the buy's last,
+        -- part-full batch, which the name lookup found first - then never got back for the 1000 beside it.
+        approachAndInteract(h.npc, function()
+            return giveItems({ h.item, h.item, h.item, h.item }, h.npc, stealthGive)
+        end, stealthGive)
+        waitUntil(function() return faction.count(h) < before end, 3000, 200)
+        if faction.count(h) < before then
+            faction.given = faction.given + (before - faction.count(h))
+            landed, misses = true, 0
+            if stealthGive then
+                -- Only a sign of whether he is still hostile: a con made in a shroud does not show the character's
+                -- real standing (v2.45 - see faction.run).
+                local tier = faction.conTier(considerNpc(h.npc))
+                print(string.format('\ay[Postmaster]\ax %d %s handed over - %s cons %s to the shroud (not your real'
+                    .. ' standing - Check shows that after the camp).', faction.given, h.item, h.npc, tier or "?"))
+            end
+        else
+            misses = misses + 1
+            if mq.TLO.Window('GiveWnd').Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+            if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
+            mq.delay(500)
+        end
+    end
+    if misses >= 3 then
+        printIfRunning('\ar[Postmaster]\ax ' .. h.npc .. ' did not take the ' .. h.item .. ' after 3 tries.')
+    end
+    -- Finish somewhere safe: back to the book, not standing in the field waiting for him to lead the next
+    -- guard patrol over. Not after a death or a Stop - the player has the controls then.
+    if m and running and not automation.stop and not mq.TLO.Me.Hovering() then
+        faction.status = "Walking back to the PoK book..."
+        faction.backToWait(h)
+    end
+    return landed
+end
+
+-- COIN HELPERS (v2.58) - money instead of items. MQ can READ money but has no command that moves it (its docs,
+-- definitions and source all checked), so coins move the way a player moves them: click a money slot, type
+-- how many, click where they go - and every move is judged by the COUNTS afterwards, never by the click.
+
+-- Exactly n coins of one metal ("Platinum", "Gold"...) onto the cursor from a money slot, or none. The
+-- quantity box is typed and must READ n before Accept: once in 255 gives (luatools/coingive, 2026-09-28) it
+-- still held its default - the WHOLE purse - and 1,588 gold came up. The window has no Cancel; DoClose it.
+function faction.coinPickUp(wnd, child, n, metal)
+    local qty = mq.TLO.Window('QuantityWnd')
+    local function onCursor() return mq.TLO.Me['Cursor' .. metal]() or 0 end
+    mq.TLO.Window(wnd).Child(child).LeftMouseUp()
+    mq.delay(2000, function() return qty.Open() == true or onCursor() > 0 end)
+    if qty.Open() then
+        local want, box = tostring(n), qty.Child('QTYW_SliderInput')
+        for _ = 1, 3 do
+            box.SetText(want)
+            mq.delay(1000, function() return box.Text() == want end)
+            if box.Text() == want then break end
+        end
+        if box.Text() == want then
+            qty.Child('QTYW_Accept_Button').LeftMouseUp()
+            mq.delay(2000, function() return onCursor() > 0 end)
+        else
+            qty.DoClose()
+            mq.delay(1000, function() return not qty.Open() end)
+        end
+    end
+    if onCursor() == n then return true end
+    if onCursor() > 0 then
+        mq.cmd('/autoinventory')   -- a wrong pile goes back in the purse - and is WAITED for
+        mq.delay(3000, function() return onCursor() == 0 end)
+    end
+    return false
+end
+
+-- n coins from one money slot to another: purse and bank, either way. With the BANK window open, platinum
+-- dropped on the purse's GOLD slot comes out as gold, 1 pp = 10 gp (AL, Live, 2026-09-28 - it works nowhere
+-- else, and the bank's Change button goes the other way). The caller checks the counts.
+function faction.coinMove(fromWnd, fromChild, toWnd, toChild, n, metal)
+    n = math.floor(n)
+    if n < 1 then return false end
+    if not faction.coinPickUp(fromWnd, fromChild, n, metal) then return false end
+    local function onCursor() return mq.TLO.Me['Cursor' .. metal]() or 0 end
+    mq.TLO.Window(toWnd).Child(toChild).LeftMouseUp()
+    mq.delay(3000, function() return onCursor() == 0 end)
+    if onCursor() > 0 then
+        mq.cmd('/autoinventory')
+        mq.delay(3000, function() return onCursor() == 0 end)
+        return false
+    end
+    return true
+end
+
+-- Gold in the purse up to `want`, at the OPEN bank (AL, 2026-09-28: fetched 2,000 platinum, reached Fabian with
+-- no gold - "if I did this simple mistake users sure will"). The bank's gold first, then platinum broken into
+-- gold, the purse's platinum before the bank's. Returns the purse's gold.
+function faction.makeGold(want)
+    local me = mq.TLO.Me
+    local short = want - (me.Gold() or 0)
+    if short > 0 and (me.GoldBank() or 0) >= 1 then
+        faction.coinMove('BigBankWnd', 'BNK_Money1', 'InventoryWindow', 'IW_Money1', math.min(short, me.GoldBank() or 0), 'Gold')
+        short = want - (me.Gold() or 0)
+    end
+    if short > 0 then
+        local pp = math.ceil(short / 10)
+        if (me.Platinum() or 0) < pp and (me.PlatinumBank() or 0) >= 1 then
+            faction.coinMove('BigBankWnd', 'BNK_Money0', 'InventoryWindow', 'IW_Money0',
+                math.min(pp - (me.Platinum() or 0), me.PlatinumBank() or 0), 'Platinum')
+        end
+        pp = math.floor(math.min(pp, me.Platinum() or 0))
+        if pp > 0 then
+            local before = me.Gold() or 0
+            print(string.format('\ay[Postmaster]\ax you have %d platinum but %d gold - making change: %d platinum into'
+                .. ' %d gold.', math.floor(me.Platinum() or 0), math.floor(before), pp, pp * 10))
+            faction.coinMove('InventoryWindow', 'IW_Money0', 'InventoryWindow', 'IW_Money1', pp, 'Platinum')
+            if (me.Gold() or 0) < before + pp * 10 then
+                print('\ar[Postmaster]\ax the bank did not make change - the platinum is back in your purse.')
+            end
+        end
+    end
+    return me.Gold() or 0
+end
+
+-- The give loop (v2.58), from luatools/coingive - 88 gives a minute over 780 on Xanley. `gives` trades of
+-- exactly h.perGive coins each: Fabian hands back anything else (80 gold), so one trade is one turn-in. The
+-- give's own faction line is the proof it counted; a hand-back refills the purse and is tried again (Fabian
+-- does it now and then). `masked`: the Sneak mask must hold - a dropped Sneak is put back ALONE, standing still
+-- behind him (AL's decision 3), and the loop stops if it will not come back. Returns how many were paid, and
+-- why it stopped early (nil when every give went over).
+function faction.coinGive(h, gives, masked)
+    local me = mq.TLO.Me
+    local give = mq.TLO.Window('GiveWnd')
+    local slot = 'IW_Money' .. faction.moneySlot[h.coin]
+    local function purse() return me[h.coin]() or 0 end
+    local function onCursor() return me['Cursor' .. h.coin]() or 0 end
+    local npcId = mq.TLO.Spawn("npc " .. h.npc).ID() or 0
+    local paidLines, done, backInRow, slipInRow, why = 0, 0, 0, 0, nil
+    pcall(mq.unevent, 'PMCoinPaid')   -- a run that ended in an error could have left it registered
+    mq.event('PMCoinPaid', 'Your faction standing with #*#', function() paidLines = paidLines + 1 end)
+    mq.TLO.Window('InventoryWindow').DoOpen()
+    mq.delay(2000, function() return mq.TLO.Window('InventoryWindow').Open() == true end)
+    while done < gives do
+        automation.hold()
+        if not running or automation.stop or me.Hovering() or justFledCombat then break end
+        if fleeIfInCombat() then why = "a fight started"; break end
+        if purse() < h.perGive then why = "out of " .. h.unit; break end
+        if masked and not me.Sneaking() then
+            setStealth(true, 2, true)
+            if not me.Sneaking() then why = "Sneak dropped and would not come back"; break end
+        end
+        if (mq.TLO.Target.ID() or 0) ~= npcId then
+            mq.cmdf('/target id %d', npcId)
+            mq.delay(1000, function() return (mq.TLO.Target.ID() or 0) == npcId end)
+        end
+        if (mq.TLO.Target.Distance() or 999) > 20 then why = h.npc .. " is out of reach"; break end
+
+        local before = purse()
+        if not faction.coinPickUp('InventoryWindow', slot, h.perGive, h.coin) then
+            slipInRow = slipInRow + 1
+            if slipInRow >= 3 then why = "the amount would not go onto the cursor, 3 times in a row"; break end
+            mq.delay(1000)
+        else
+            slipInRow = 0
+            mq.flushevents('PMCoinPaid')
+            local paidBefore = paidLines
+            mq.TLO.Target.LeftClick()
+            mq.delay(3000, function() return give.Open() == true end)
+            local presses = 0
+            while give.Open() and presses < 12 do   -- one press does not always take
+                mq.cmd('/notify GiveWnd GVW_Give_Button leftmouseup')
+                mq.delay(500, function() return not give.Open() end)
+                presses = presses + 1
+            end
+            if give.Open() or onCursor() > 0 then
+                if give.Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+                mq.delay(2000, function() return not give.Open() end)
+                if onCursor() > 0 then mq.cmd('/autoinventory') end
+                why = "a give did not complete"
+                break
+            end
+            -- Paid (the faction line), or handed back (the purse refills).
+            mq.delay(1500, function()
+                mq.doevents('PMCoinPaid')
+                return paidLines > paidBefore or purse() ~= before - h.perGive
+            end)
+            if purse() ~= before - h.perGive then
+                backInRow = backInRow + 1
+                if onCursor() > 0 then mq.cmd('/autoinventory') end
+                if backInRow >= 5 then why = h.npc .. " handed it back 5 times in a row"; break end
+                dbg(string.format('%s handed it back (%d in a row) - trying again.', h.npc, backInRow))
+                mq.delay(2000)
+            else
+                backInRow = 0
+                done = done + 1
+                faction.status = string.format("Giving %s %d %s at a time - %d of %d...", h.npc, h.perGive, h.unit,
+                    done, gives)
+                mq.delay(100)
+            end
+        end
+    end
+    mq.unevent('PMCoinPaid')
+    if onCursor() > 0 then mq.cmd('/autoinventory') end
+    mq.TLO.Window('InventoryWindow').DoClose()
+    return done, why
+end
+
+-- Travel to h.npc and run `giveFn(left)` at him - which returns how many gives landed and why it stopped early -
+-- until `total` are done. v2.63 - IT CARRIES ON AFTER A FLEE, like every courier step (v2.50, AL: "carry on
+-- automatically after a flee"): a fight, or a back-off because invis would not take by a patrol, and it gets clear,
+-- rests to 80%, waits, puts invis back on and goes in again for what is left - five times at most. 2.62 stopped
+-- instead (AL: a Militia Patrol Member at the zone-in, Hide failed, the run ended) - and in a shroud, where Run
+-- could not start again. Returns how many landed, and why it stopped short (nil = all done).
+function faction.goAndGive(h, total, giveFn, sneakAnyway)
+    local done, why, flees = 0, nil, 0
+    while done < total and running and not automation.stop and not mq.TLO.Me.Hovering() do
+        why = nil
+        local landed = 0
+        if travelToZone(h.npcZone, h.npc) then
+            approachAndInteract(h.npc, function()
+                local w
+                landed, w = giveFn(total - done)
+                why = w
+                return landed > 0
+            end, false, false, sneakAnyway, h.spot)
+            done = done + landed
+        elseif not justFledCombat then
+            return done, "could not get to " .. h.npcZoneName
+        end
+        if not justFledCombat then break end
+        flees = flees + 1
+        if flees > 5 then
+            return done, "backed off 5 times - a fight, or invis would not take - something there catches you every time"
+        end
+        if not automation.recoverFromFlee(flees > 1) then return done, why or "could not get clear of it" end
+    end
+    if done == 0 and not why and running and not automation.stop and not mq.TLO.Me.Hovering() then
+        why = "could not reach " .. h.npc
+    end
+    return done, why
+end
+
+-- One trip for a coin helper (v2.58). `need` = the coins the goal wants. Returns nil when a trip as yourself
+-- landed - faction.run reads the window again and decides - or an outcome: "given" after a shrouded trip
+-- (read after Unshroud and a camp, like Bone Chips), or why it stopped.
+function faction.coinTrip(h, word, danger, need)
+    local me = mq.TLO.Me
+    local lvl = me.Level() or 0
+    -- WHO GOES HOW. Openly only if his quest will deal with you (Indifferent) AND the guards round him will not
+    -- attack. Otherwise the Sneak mask: a Rogue wears their own (AL's decision 1); an evil race from level 5
+    -- takes the Goblin Rogue shroud, the one the Bone Chips hidden give uses.
+    local mode
+    if (faction.rank(word) or 0) >= faction.rank("Indifferent") and not faction.hostile(danger) then
+        mode = "open"
+    elseif (me.Class.ShortName() or "") == "ROG" then
+        mode = "sneak"
+    elseif factionRisk and lvl >= 5 and lvl < tuning.shroudLevel then
+        mode = "shroud"
+    else
+        return string.format("%s deals only with %s Indifferent, and %s round him is %s - that needs the Sneak mask:"
+            .. " a Rogue's own, or a Goblin Rogue shroud%s", h.npc, h.faction, h.danger, tostring(danger),
+            lvl < 5 and " from level 5" or "")
+    end
+    local coins = math.ceil(need / h.perGive) * h.perGive   -- whole gives
+    print(string.format('\ay[Postmaster]\ax %s: about %d %s (%d gives) - %s.', h.title, coins, h.unit,
+        coins / h.perGive,
+        mode == "open" and "walking up to " .. h.npc .. " openly"
+            or mode == "sneak" and "sneaking up behind " .. h.npc .. " as yourself"
+            or "taking a Goblin Rogue shroud (your coins go with you) and sneaking up behind " .. h.npc))
+
+    -- THE MONEY, as yourself: short of gold, the bank makes it up. v2.62 - A PoK SHROUD KEEPS THE COINS YOU CARRY
+    -- (AL: the game changed this; long ago money had to go through the bank, and mission shrouds differ), so the gold
+    -- just travels in the purse - 2.58-2.61 banked it and took it back out as the shroud, for nothing.
+    automation.noShroud = true
+    if (me[h.coin]() or 0) < coins then
+        faction.status = "At the bank, sorting out the gold..."
+        if not faction.openBank() then
+            automation.noShroud = false
+            if automation.stop or not running then return nil end
+            return "could not get to " .. faction.banker .. " in PoK to sort out the gold"
+        end
+        mq.TLO.Window('InventoryWindow').DoOpen()
+        mq.delay(2000, function() return mq.TLO.Window('InventoryWindow').Open() == true end)
+        faction.makeGold(coins)
+        faction.closeBank()
+    end
+    automation.noShroud = false
+    if automation.stop or not running then return nil end
+    if mode == "shroud" then
+        ensureShroud(true)
+        if not me.Shrouded() then return "could not take the Goblin Rogue shroud" end
+    end
+
+    local gives = math.floor(math.min(coins, me[h.coin]() or 0) / h.perGive)
+    if gives < 1 then
+        return string.format("you need %d gold - on you and in the bank there is %d gold and %d platinum", coins,
+            math.floor((me.Gold() or 0) + (me.GoldBank() or 0)), math.floor((me.Platinum() or 0) + (me.PlatinumBank() or 0)))
+    end
+    if gives * h.perGive < coins then
+        print(string.format('\ay[Postmaster]\ax only %d %s to hand over - going with that (%d wanted).',
+            gives * h.perGive, h.unit, coins))
+    end
+
+    faction.status = string.format("Taking %d %s to %s...", gives * h.perGive, h.unit, h.npc)
+    -- Not `keepHidden`: in the mask, approachAndInteract drops Hide ONLY at his back and keeps Sneak - exactly
+    -- AL's hand-over. A trade would drop Hide anyway. goAndGive carries on after a flee (v2.63).
+    local done, why = faction.goAndGive(h, gives, function(left)
+        return faction.coinGive(h, left, mode ~= "open")
+    end, mode == "sneak")
+    faction.given = faction.given + done * h.perGive
+    faction.planGave(h, done * h.perGive)
+    if mode == "shroud" then
+        if done > 0 then
+            if why then print('\ay[Postmaster]\ax ' .. h.title .. ' stopped early: ' .. why .. '.') end
+            return "given"
+        end
+        return why
+    end
+    return why
+end
+
+-- LOOP HELPERS (v2.60) - many trades of a few items, bought where the NPC stands (Palatos's Ale). From
+-- luatools/itemgive, proven on Xanley: 25 turn-ins, 3.3 s each, 25 Lore beacons destroyed, nothing handed back.
+
+-- Up to 10 stacks of h.item from h.shop, standing where we are (he must be within 20 - `spot` puts us there),
+-- keeping three bag slots free. Each stack confirmed by the COUNT. Targets h.npc again after. Returns how many
+-- arrived, and why none did.
+function faction.restock(h)
+    local shop = mq.TLO.Spawn("npc " .. h.shop)
+    if (shop.ID() or 0) == 0 then return 0, h.shop .. " is not here" end
+    if (shop.Distance() or 999) > 20 then
+        return 0, string.format("%s is %d away from here - out of reach for his shop", h.shop, math.floor(shop.Distance() or 0))
+    end
+    local got, why = 0, nil
+    mq.cmdf('/target id %d', shop.ID())
+    mq.delay(1000, function() return (mq.TLO.Target.ID() or 0) == shop.ID() end)
+    mq.cmd('/click right target')
+    mq.delay(5000, function() return mq.TLO.Merchant.Open() == true end)
+    if not mq.TLO.Merchant.Open() then
+        why = h.shop .. "'s shop did not open"
+    else
+        mq.delay(5000, function() return mq.TLO.Merchant.ItemsReceived() == true end)
+        for _ = 1, 3 do
+            mq.TLO.Merchant.SelectItem('=' .. h.item)()
+            mq.delay(1500, function() return mq.TLO.Merchant.SelectedItem.Name() == h.item end)
+            if mq.TLO.Merchant.SelectedItem.Name() == h.item then break end
+        end
+        if mq.TLO.Merchant.SelectedItem.Name() ~= h.item then
+            why = h.shop .. " does not sell " .. h.item
+        else
+            local stack = math.max(mq.TLO.Merchant.SelectedItem.StackSize() or 1, 1)
+            local before = faction.count(h)
+            for _ = 1, 10 do
+                if (mq.TLO.Me.FreeInventory() or 0) < 3 then break end
+                local want = faction.count(h) + stack
+                mq.TLO.Merchant.Buy(stack)()
+                mq.delay(4000, function() return faction.count(h) >= want end)
+                if faction.count(h) < want then break end   -- nothing arrived (money?) - stop spending blind
+            end
+            got = faction.count(h) - before
+            if got == 0 then why = "could not buy " .. h.item .. " from " .. h.shop .. " - out of money, or bags full" end
+        end
+        mq.cmd('/notify MerchantWnd MW_Done_Button leftmouseup')
+        mq.delay(2000, function() return not mq.TLO.Merchant.Open() end)
+    end
+    mq.cmdf('/target id %d', mq.TLO.Spawn("npc " .. h.npc).ID() or 0)
+    mq.delay(1000)
+    if got > 0 then print(string.format('\ag[Postmaster]\ax bought %d %s from %s.', got, h.item, h.shop)) end
+    return got, why
+end
+
+-- Exactly n of h.item onto the cursor, or none - through the quantity box, typed and READ back before Accept.
+function faction.itemPickUp(h, n)
+    local qty = mq.TLO.Window('QuantityWnd')
+    local function onCursor() return mq.TLO.Cursor.Name() == h.item end
+    mq.cmdf('/nomodkey /itemnotify "%s" leftmouseup', h.item)
+    mq.delay(2000, function() return qty.Open() == true or onCursor() end)
+    if qty.Open() then
+        local want, box = tostring(n), qty.Child('QTYW_SliderInput')
+        for _ = 1, 3 do
+            box.SetText(want)
+            mq.delay(1000, function() return box.Text() == want end)
+            if box.Text() == want then break end
+        end
+        if box.Text() ~= want then
+            qty.DoClose()
+            mq.delay(1000, function() return not qty.Open() end)
+            return false
+        end
+        qty.Child('QTYW_Accept_Button').LeftMouseUp()
+        mq.delay(2000, onCursor)
+    end
+    if onCursor() and (mq.TLO.Cursor.Stack() or 1) == n then return true end
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        mq.cmd('/autoinventory')
+        mq.delay(2000, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    end
+    return false
+end
+
+-- DESTROYS every h.destroy carried - a LORE reward that blocks the next turn-in (Palatos's Beacon Mount, which
+-- lands in the bags). The ONLY item this script destroys, and only with that exact name on the cursor and NO
+-- coins held in the instant before: MQ's /destroy is EQDestroyHeldItemOrMoney - it destroys held coins too.
+-- Returns false if one is still there.
+function faction.destroyReward(h)
+    local me = mq.TLO.Me
+    local function coins()
+        return (me.CursorPlatinum() or 0) + (me.CursorGold() or 0) + (me.CursorSilver() or 0) + (me.CursorCopper() or 0) > 0
+    end
+    for _ = 1, 5 do
+        if mq.TLO.Cursor.Name() ~= h.destroy then
+            if (mq.TLO.FindItemCount('=' .. h.destroy)() or 0) == 0 then return true end
+            if (mq.TLO.Cursor.ID() or 0) > 0 then
+                mq.cmd('/autoinventory')
+                mq.delay(2000, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            end
+            mq.cmdf('/nomodkey /itemnotify "%s" leftmouseup', h.destroy)
+            mq.delay(2000, function() return mq.TLO.Cursor.Name() == h.destroy end)
+        end
+        if mq.TLO.Cursor.Name() ~= h.destroy or coins() then return false end
+        mq.cmd('/destroy')
+        mq.delay(2000, function() return mq.TLO.Cursor.Name() ~= h.destroy end)
+    end
+    return (mq.TLO.FindItemCount('=' .. h.destroy)() or 0) == 0 and mq.TLO.Cursor.Name() ~= h.destroy
+end
+
+-- The give loop: `trades` turn-ins of exactly h.perTrade, the reward destroyed before and after each, restocked
+-- from h.shop when fewer than one trade's worth is left. `masked`: Sneak must hold - put back ALONE if it drops
+-- (Hide off at his back, as with Fabian). A trade whose items come back stops it. Returns turn-ins, and why it
+-- stopped early (nil = all done).
+function faction.itemLoop(h, trades, masked)
+    local me = mq.TLO.Me
+    local give = mq.TLO.Window('GiveWnd')
+    local npcId = mq.TLO.Spawn("npc " .. h.npc).ID() or 0
+    local done, why = 0, nil
+    while done < trades do
+        automation.hold()
+        if not running or automation.stop or me.Hovering() or justFledCombat then break end
+        if fleeIfInCombat() then why = "a fight started"; break end
+        if masked and not me.Sneaking() then
+            setStealth(true, 2, true)
+            if not me.Sneaking() then why = "Sneak dropped and would not come back"; break end
+        end
+        if faction.count(h) < h.perTrade then
+            faction.status = string.format("Buying %s from %s...", h.item, h.shop)
+            local _, whyNot = faction.restock(h)
+            if faction.count(h) < h.perTrade then why = whyNot or ("out of " .. h.item); break end
+        end
+        if not faction.destroyReward(h) then why = "could not destroy the " .. h.destroy .. " - it blocks the next turn-in"; break end
+        if (mq.TLO.Target.ID() or 0) ~= npcId then
+            mq.cmdf('/target id %d', npcId)
+            mq.delay(1000, function() return (mq.TLO.Target.ID() or 0) == npcId end)
+        end
+        if (mq.TLO.Target.Distance() or 999) > 20 then why = h.npc .. " is out of reach"; break end
+
+        local before = faction.count(h)
+        if not faction.itemPickUp(h, h.perTrade) then why = "could not put exactly " .. h.perTrade .. " on the cursor"; break end
+        mq.TLO.Target.LeftClick()
+        mq.delay(3000, function() return give.Open() == true end)
+        local presses = 0
+        while give.Open() and presses < 12 do   -- one press does not always take
+            mq.cmd('/notify GiveWnd GVW_Give_Button leftmouseup')
+            mq.delay(500, function() return not give.Open() end)
+            presses = presses + 1
+        end
+        if give.Open() or mq.TLO.Cursor.Name() == h.item then
+            if give.Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+            mq.delay(2000, function() return not give.Open() end)
+            if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
+            why = "a trade did not complete"
+            break
+        end
+        -- The reward lands a moment after the trade; destroy it, then judge by the count.
+        mq.delay(2000, function() return (mq.TLO.FindItemCount('=' .. h.destroy)() or 0) > 0 end)
+        faction.destroyReward(h)
+        if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
+        if faction.count(h) >= before then why = h.npc .. " handed them back"; break end
+        done = done + 1
+        faction.given = faction.given + h.perTrade
+        faction.status = string.format("Giving %s %d %s at a time - %d of %d...", h.npc, h.perTrade, h.item, done, trades)
+        mq.delay(200)
+    end
+    return done, why
+end
+
+-- One trip for a loop helper (v2.60). `need` = items the goal wants. Returns nil when a trip as yourself landed
+-- (faction.run reads again), or an outcome: "given" after a shrouded trip, or why it stopped.
+function faction.loopTrip(h, danger, npcWord, need)
+    local me = mq.TLO.Me
+    local lvl = me.Level() or 0
+    -- AN NPC HOSTILE TO YOU IN THE SAME ROOM SEES THROUGH SNEAK at that range (Guard Raflin killed a sneaking
+    -- Xanley). Canlan Talespinner stands beside Palatos - so the helper that fixes his faction goes first.
+    if faction.hostile(danger) then
+        return string.format("%s (%s) stands in %s's room and reads %s to you - close up, a hostile NPC sees through"
+            .. " Sneak. Run %s first", h.dangerNpc, h.danger, h.npc, danger, h.dangerFix)
+    end
+    local mode
+    if not faction.hostile(npcWord) then
+        mode = "open"
+    elseif (me.Class.ShortName() or "") == "ROG" then
+        mode = "sneak"
+    elseif factionRisk and lvl >= 5 and lvl < tuning.shroudLevel then
+        mode = "shroud"
+    else
+        return string.format("%s reads %s to you (%s) and attacks on sight - that needs the Sneak mask: a Rogue's own,"
+            .. " or a Goblin Rogue shroud%s", h.npc, tostring(npcWord), h.npcFaction, lvl < 5 and " from level 5" or "")
+    end
+    local trades = math.floor(need / h.perTrade)
+
+    -- THE MONEY - none of it planned ahead any more (v2.64, AL: "why are we running to Berina to check the price of
+    -- the Ale? What is the point of this?"). 2.60 read the price in PoK because the shroud had to carry banked
+    -- platinum it could not come back for; since 2.62 a PoK shroud keeps your coins, and the ale costs coppers. So
+    -- the ale is simply bought from h.shop as it goes, and if the money ever runs out the loop says so - Run then
+    -- carries on after a top-up (faction.plan).
+    print(string.format('\ay[Postmaster]\ax %s: %d %s (%d turn-ins), bought from %s beside him as it goes.', h.title,
+        need, h.item, trades, h.shop))
+    if (me.Cash() or 0) == 0 and faction.count(h) < h.perTrade then
+        return "no money on you to buy " .. h.item .. " with - take some platinum from your bank, then Run"
+    end
+
+    if mode == "shroud" then
+        ensureShroud(true)
+        if not me.Shrouded() then return "could not take the Goblin Rogue shroud" end
+    end
+
+    faction.status = string.format("Going to %s...", h.npc)
+    -- Not `keepHidden`: at his back, Hide off and Sneak on for the trades - AL's method, as with Fabian.
+    -- goAndGive carries on after a flee or a back-off (v2.63) - 2.62 stopped here, shrouded, at a patrol.
+    local done, why = faction.goAndGive(h, trades, function(left)
+        return faction.itemLoop(h, left, mode ~= "open")
+    end, mode == "sneak")
+    faction.planGave(h, done * h.perTrade)
+    if mode == "shroud" then
+        if done > 0 then
+            if why then print('\ay[Postmaster]\ax ' .. h.title .. ' stopped early: ' .. why .. '.') end
+            return "given"
+        end
+        return why
+    end
+    return why
+end
+
+-- The Unshroud button (v2.41, AL): to Shroudkeeper Hyush in PoK and say "remove". Main loop only.
+function faction.unshroudNow(i)
+    faction.last, faction.active, faction.given = i, i, 0
+    automation.stop, automation.paused = false, false
+    if not mq.TLO.Me.Shrouded() then
+        faction.status = "You are not shrouded."
+    else
+        faction.status = "Going to Shroudkeeper Hyush to remove the shroud..."
+        if travelToZone(zones.pokShort, "Shroudkeeper Hyush") and navToNpc("Shroudkeeper Hyush") then
+            mq.cmd('/makemevisible')   -- a say does not register while hidden
+            mq.delay(500)
+            sayPhrase("Shroudkeeper Hyush", "remove")
+            waitUntil(function() return not mq.TLO.Me.Shrouded() end, 15000, 500)
+        end
+        if automation.stop then
+            faction.status = "Stopped."
+        elseif mq.TLO.Me.Shrouded() then
+            faction.status = "Still shrouded - say \"remove\" to Shroudkeeper Hyush in PoK."
+            printIfRunning('\ar[Postmaster]\ax ' .. faction.status)
+        else
+            faction.status = "Shroud removed. Camp to character select and come back before Run or Check -"
+                .. " EQ keeps your Faction window empty after a shroud until you do."
+            print('\ag[Postmaster]\ax shroud removed. \ayCamp to character select and come back before Run or Check\ax -'
+                .. ' EQ keeps your Faction window empty after a shroud until you do.')
+        end
+    end
+    faction.active = nil
+    automation.stop, automation.paused = false, false
+end
+
+-- One helper, start to finish: read -> buy if the bags are empty -> give a stack -> read again, until the
+-- goal tier is reached, the standing stops moving, or something needs the player. Main loop only.
+-- v2.41: when the NPC himself is hostile it is ONE shrouded trip instead (see the hostile branch).
+function faction.run(i)
+    local h = faction.helpers[i]
+    local goal = faction.goalFor(h)
+    automation.stop, automation.paused = false, false
+    -- v2.58: a run starts with no flee on the books. retryStep clears it for the courier steps, but a faction run
+    -- never passes through retryStep - so a fight in one left it set, and the next faction run's fleeIfInCombat
+    -- (idempotent: "already fleeing") would have ignored a NEW fight.
+    justFledCombat = false
+    faction.active, faction.given, faction.banked = i, 0, 0
+    local outcome, word, lastStanding = nil, nil, nil
+    for round = 1, 12 do   -- a round is one vendor trip + one visit; even Ally from nothing needs one if bags allow
+        -- v2.41 (AL): a run starts as YOURSELF. A shroud empties the Faction window, so nothing could be read.
+        if mq.TLO.Me.Shrouded() then
+            -- v2.63: EXCEPT a coin or loop run already sized as yourself - it carries on with what is left (AL's 2.62
+            -- run ended shrouded at a patrol, and Run refused to go on).
+            local p = faction.plan
+            if round == 1 and (h.coin or h.loop) and p and p.key == h.key and p.need > 0 then
+                print(string.format('\ay[Postmaster]\ax %s: carrying on the run you started as yourself - about %d %s'
+                    .. ' left.', h.title, p.need, h.item or h.unit))
+                if h.coin then
+                    outcome = faction.coinTrip(h, p.word, p.danger, p.need)
+                else
+                    outcome = faction.loopTrip(h, p.danger, p.npcWord, p.need)
+                end
+                outcome = outcome or "given"
+                break
+            end
+            outcome = "you are shrouded - a run starts as yourself. Press Unshroud, then camp to character select"
+                .. " and come back (EQ keeps the Faction window empty after a shroud until you do), then Run"
+            break
+        end
+        faction.status = "Reading " .. h.faction .. "..."
+        local standing, danger, npcWord
+        word, standing, danger, npcWord = faction.refresh(h)
+        if automation.stop or not running then break end
+        if not word then
+            outcome = faction.empty and faction.emptyWhy() or ("could not read " .. h.faction .. " from the Faction window")
+            break
+        end
+        if not faction.rank(word) then outcome = "does not recognise the reaction \"" .. word .. "\""; break end
+        if faction.rank(word) >= faction.rank(goal) then outcome = "done"; break end
+        local need = faction.estimate(h, standing, goal)
+        -- v2.58: below the goal with nothing left to give = the +2,000 earned cap. More of this quest cannot help.
+        if need == 0 then
+            outcome = standing >= 2000
+                and string.format("%s is %s with the earned standing at its +2,000 cap - this quest cannot take it"
+                    .. " to %s", h.faction, word, goal)
+                -- v2.61: this said "camp, come back and Check" - wrong advice: the one time it showed, the cause was
+                -- the race read from a shroud (fixed in the main loop). Say what the numbers used, so a report can tell.
+                or string.format("%s reads %s, short of %s, though its numbers say it should be there (earned %d,"
+                    .. " adjustments %d for %s / %s / %s) - press Check; if it stays, please report this line",
+                    h.faction, word, goal, standing, faction.adjustFor(h), myRace, mq.TLO.Me.Class.Name() or "?",
+                    tostring(mq.TLO.Me.Deity() or "?"))
+            break
+        end
+        local want = need and (math.ceil(need * 1.1) + 10) or 200   -- 10% over: another trip costs far more
+        if h.perSet then want = math.ceil(want / h.perSet) * h.perSet end   -- v2.59: whole sets (Lady Shae's 4)
+        if round == 1 and need then
+            print(string.format('\ag[Postmaster]\ax %s is %s - about %d %s to reach %s.', h.faction, word, need,
+                h.item or h.unit, goal))
+        end
+        -- v2.58 - A COIN HELPER takes its own path (faction.coinTrip): the money, who goes how, the give loop.
+        -- As yourself it comes back here to read again; a shrouded trip ends like Bone Chips' ("given").
+        -- v2.60: a LOOP helper (many trades of a few items bought beside the NPC - Palatos's Ale) the same way.
+        if h.coin or h.loop then
+            if not need then outcome = "could not read the earned standing, so the trip cannot be sized"; break end
+            if lastStanding and standing <= lastStanding then
+                outcome = h.faction .. " did not go up after the last trip - it may be as high as this quest takes it"
+                break
+            end
+            lastStanding = standing
+            faction.plan = { key = h.key, need = need, word = word, danger = danger, npcWord = npcWord }   -- v2.63
+            if h.coin then
+                outcome = faction.coinTrip(h, word, danger, need)
+            else
+                outcome = faction.loopTrip(h, danger, npcWord, need)
+            end
+            if outcome or automation.stop or not running then break end
+        else
+            -- v2.36: the NPC we give to must not want us dead - Lashun (Priests of Life, Scowls) killed a level 1
+            -- Iksar that reached him safely past the guards. If he is hostile the items can only go over while
+            -- hidden, which needs a shroud: an evil race from level 5 to under tuning.shroudLevel gets one.
+            -- v2.41, AL's design - ONE TRIP. In a shroud the Faction window is empty (and stays empty until a camp)
+            -- and nothing can be bought, so there is no reading between rounds and no second visit to the vendor.
+            -- Everything the Stop at goal needs is bought and banked as yourself, the shroud takes exactly that
+            -- back out, goes straight to him and hands it ALL over in one trade, conning him after it. The result is
+            -- read by the player's Check after unshrouding and camping - never in the shroud (v2.45, below).
+            -- v2.59: ALSO when the GUARDS round a helper NPC are hostile and there is no safe meeting spot (`meet` -
+            -- Lashun has one). Lady Shae only glowers, but West Freeport's Militia attack Xanley on sight; before
+            -- this, the item path would have walked him in visible.
+            if faction.hostile(npcWord) or (faction.hostile(danger) and not h.meet) then
+                local who = faction.hostile(npcWord) and string.format("%s reads %s to you (%s)", h.npc, npcWord, h.npcFaction)
+                    or string.format("%s round %s reads %s", h.danger, h.npc, danger)
+                local lvl = mq.TLO.Me.Level() or 0
+                if not (factionRisk and lvl >= 5 and lvl < tuning.shroudLevel) then
+                    outcome = string.format("%s and attacks on sight, so nothing can be handed"
+                        .. " over openly - only while hidden, which needs a Goblin Rogue shroud (level 5+). %s", who,
+                        lvl < 5 and "Come back at level 5"
+                            or "Take a Goblin Rogue shroud from Shroudkeeper Hyush in PoK and hand them over hidden yourself")
+                    break
+                end
+                print(string.format('\ay[Postmaster]\ax %s and attacks on sight - one trip: buy them'
+                    .. ' all as yourself, bank them, shroud, and hand them over hidden.', who))
+                local ok, why = faction.bankAndShroud(h, want, goal)
+                if not ok then outcome = why; break end
+                faction.status = string.format("Taking %d %s to %s, shrouded...", faction.count(h), h.item, h.npc)
+                local landed = faction.give(h, false, true)
+                if automation.stop or not running then break end
+                -- v2.44: 2.43 broke out here with no outcome after a death and said "too many rounds".
+                if mq.TLO.Me.Hovering() then outcome = "you died on the way to " .. h.npc; break end
+                if not landed then outcome = "could not give " .. h.item .. " to " .. h.npc; break end
+                -- v2.45: NO goal reading in a shroud. 2.41-2.44 read it off a nearby guard's con; on Xanley the cons
+                -- right after the give said Indifferent where the window, after the camp, said Amiably (standing
+                -- 1629) - a value no number of chips can give both factions at once under his real adjustments -
+                -- while his own cons as himself matched the window exactly (AL, 2026-09-27). The camp is needed to
+                -- see the Faction window again anyway, so Check after it is the one true reading.
+                outcome = "given"
+                break
+            end
+            -- The one number we can read tells us whether the last give landed. If it did not move, more of
+            -- the same will not either - say so rather than buying and walking round in circles.
+            if lastStanding and standing and standing <= lastStanding then
+                outcome = h.faction .. " did not go up after the last give - it may be as high as this quest takes it"
+                break
+            end
+            lastStanding = standing
+            local careful = faction.hostile(danger) and h.meet ~= nil
+            if round == 1 and faction.hostile(danger) then
+                print(string.format('\ar[Postmaster]\ax %s reads %s - the guards on the way to %s will attack you on sight%s.',
+                    h.danger, danger, h.npc, careful and ' - so this run meets him out in the field, away from them'
+                        or ', and you are not shrouded'))
+            end
+            -- SUPPLY (v2.39, AL: *"Do we need personal inv, and bank check and then buy if we need more for desired
+            -- 'Stop At' selection? Plus user notice what is happening."*). Count the bags and the personal bank
+            -- against what the goal wants and SAY so; then top up from the bank first (free), and buy only the rest.
+            local short = faction.stockLine(h, want, goal)   -- said every round, "enough" too
+            if faction.count(h) < want then
+                if faction.bankCount(h) > 0 then
+                    faction.status = string.format("Taking %s out of the bank...", h.item)
+                    if faction.openBank() then faction.withdraw(h) end
+                    faction.closeBank()
+                end
+                if short > 0 then
+                    faction.status = string.format("Buying %d %s in the %s...", short, h.item, h.vendorWhere)
+                    faction.buy(h, short)
+                end
+                if faction.count(h) == 0 then outcome = "could not buy " .. h.item; break end
+            end
+            faction.status = string.format("Taking %s to %s...", h.item, h.npc)
+            if not faction.give(h, careful, false) then outcome = "could not give " .. h.item .. " to " .. h.npc; break end
+        end
+    end
+
+    -- Leave nothing half-done on screen: a shop, bank or give window open, or an item on the cursor.
+    automation.noShroud = false   -- belt and braces: never leave travel unable to shroud
+    faction.closeBank()
+    if mq.TLO.Merchant.Open() then mq.cmd('/notify MerchantWnd MW_Done_Button leftmouseup') end
+    if mq.TLO.Window('GiveWnd').Open() then mq.cmd('/notify GiveWnd GVW_Cancel_Button leftmouseup') end
+    if (mq.TLO.Cursor.ID() or 0) > 0 then mq.cmd('/autoinventory') end
+
+    -- v2.59: A SHROUDED TRIP ENDS BY LEAVING - back to PoK, where Unshroud is - not standing at the NPC with Hide
+    -- dropped by the trade. At Lady Shae's (AL, 2026-09-28) Guard Raflin walked up to a sneaking Xanley after a
+    -- trade and killed him: a close hostile NPC sees through Sneak alone. Invis back on first, standing still.
+    if outcome == "given" and running and not automation.stop and not mq.TLO.Me.Hovering() and not justFledCombat
+        and mq.TLO.Me.Shrouded() then
+        faction.status = "Handed over - leaving for PoK..."
+        if not (mq.TLO.Me.Sneaking() and mq.TLO.Me.Invis()) then setStealth(true, 3) end
+        travelToZone(zones.pokShort, "Shroudkeeper Hyush")
+    end
+
+    if not running then
+        faction.status = ""
+    elseif automation.stop then
+        mq.cmd('/nav stop')
+        mq.cmd('/travelto stop')
+        faction.status = "Stopped."
+        print('\ay[Postmaster]\ax ' .. h.title .. ' stopped.')
+    elseif outcome == "done" then
+        if faction.plan and faction.plan.key == h.key then faction.plan = nil end   -- v2.63: nothing left to carry on
+        faction.status = string.format("Done - %s is %s.", h.faction, word)
+        print(string.format('\ag[Postmaster]\ax %s: %s is now %s.', h.title, h.faction, word))
+        ui.announce(nil, h.faction .. " is now " .. word .. ".")
+    elseif outcome == "given" then
+        -- The shrouded trip finished. Its result cannot be read in a shroud (see above), so it is not a failure
+        -- and gets no alarm - just the one step left, which is the player's.
+        faction.status = string.format("Gave %d %s to %s. Press Unshroud, camp to character select, come back,"
+            .. " then Check.", faction.given, h.item or h.unit, h.npc)
+        print(string.format('\ag[Postmaster]\ax %s: gave %d %s to %s. In a shroud your standing cannot be read -'
+            .. ' the Faction window is empty, and a con taken sneaking reads everyone Indifferent.', h.title,
+            faction.given, h.item or h.unit, h.npc))
+        ui.announce(nil, faction.given .. " " .. (h.item or h.unit) .. " handed over.")
+    else
+        outcome = outcome or "too many rounds without reaching the goal"
+        faction.status = "Stopped: " .. outcome .. "."
+        -- "Bone Chips stopped: could not buy Bone Chips." - v2.29 read "Bone Chips could not buy Bone Chips."
+        print('\ar[Postmaster]\ax ' .. h.title .. ' stopped: ' .. outcome .. '.')
+        ui.announce("alert.wav", h.title .. " stopped.<silence msec='250'/> Postmaster is waiting for you.", true)
+    end
+    -- After the shrouded trip, whatever the outcome: the one step left is the player's.
+    if running and faction.given > 0 and mq.TLO.Me.Shrouded() then
+        print('\ay[Postmaster]\ax Next: press Unshroud, then camp to character select and come back - EQ keeps your'
+            .. ' Faction window empty after a shroud until you do.')
+    end
+    faction.active = nil
+    automation.stop, automation.paused = false, false
 end
 
 -- UI
@@ -4887,7 +6836,20 @@ function ui.overview()
             local nbVal, nbChanged = imgui.InputText("##neighborhood", state.neighborhood or "", 64)
             if nbChanged then state.neighborhood = nbVal; saveState() end
             if imgui.IsItemHovered() then
-                imgui.SetTooltip("Default 'Alliance' is a public neighborhood on every server - no need to change it.\nType your preferred name here to use your own instead. Hit enter to save.")
+                imgui.SetTooltip("Default '" .. ui.defaultNeighborhood .. "' is a public neighborhood on every server - no need to change it.\n"
+                    .. "Type your preferred name here to use your own instead. Hit enter to save.")
+            end
+            -- Only offered once the name has been changed (v2.30, AL: "we have a default but no way to get it
+            -- back in game") - an always-visible button would sit there doing nothing on most screens.
+            if state.neighborhood ~= ui.defaultNeighborhood then
+                imgui.SameLine(0, 6)
+                if imgui.SmallButton("Reset##neighborhood") then
+                    state.neighborhood = ui.defaultNeighborhood
+                    saveState()
+                end
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip("Back to '" .. ui.defaultNeighborhood .. "', the public neighborhood every server has.")
+                end
             end
         end
         imgui.Unindent(10)
@@ -5071,6 +7033,10 @@ function ui.overview()
     imgui.PopStyleColor()
     if turninOpen then
         imgui.Indent(10)
+        -- v2.66: the save says the satchel was received, but THIS character holds none (deleted or lost - a shared
+        -- bank one is the account's). Lysric hands a new one to anyone who finished the quest and holds none - the
+        -- server keeps the completion (AL) - so say that, instead of claiming one is still here.
+        local lost = state.lysricDone and bagLocation == nil
         -- Status line first, in the same spot the old locked-message occupied, then the buttons
         -- under it. Everything Lysric reports used to go ONLY to the console, so a user who missed
         -- the chat line was left with a button and no explanation of why nothing happened.
@@ -5078,18 +7044,29 @@ function ui.overview()
             imgui.PushStyleColor(ImGuiCol.Text, ui.lysricMsgCol[1], ui.lysricMsgCol[2], ui.lysricMsgCol[3], 1)
             imgui.TextWrapped(ui.lysricMsg)
             imgui.PopStyleColor()
+        elseif lost then
+            imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.82, 0.35, 1)
+            imgui.TextWrapped("Quest complete - but this character holds no satchel now. Lysric replaces a lost one"
+                .. " for anyone who finished the quest: hail her.")
+            imgui.PopStyleColor()
         elseif satchelDone then
-            local whereText = (bagLocation == "inventory" and "in your inventory")
-                or (bagLocation == "bank" and "in your bank")
-                or "already obtained"
+            local whereText = bagLocation == "inventory" and "in your inventory" or "in your bank"
             coloredText(0.45, 0.85, 0.45, string.format("Quest complete - you have 1 Featherweight Satchel (%s).", whereText))
         elseif state.postmasterDone then
             imgui.TextDisabled("Ready - hail Lysric to claim your reward.")
         else
             imgui.TextDisabled("Courier of Favor reward: locked until the Postmaster's Challenge is done.")
         end
+        -- v2.29: a shared-bank satchel no longer counts as this character's (see satchelCounts), so say
+        -- what it is rather than leave a player wondering why the one they can see "doesn't count".
+        if (not satchelDone or lost) and ui.sharedSatchels > 0 then
+            imgui.PushStyleColor(ImGuiCol.Text, 0.56, 0.52, 0.45, 1)
+            imgui.TextWrapped("Your shared bank holds a satchel. The shared bank belongs to your whole account,"
+                .. " so this character still earns its own from Lysric.")
+            imgui.PopStyleColor()
+        end
 
-        if satchelDone then
+        if satchelDone and not lost then
             imgui.TextDisabled("The satchel is Lore - bank one in your shared bank, then hail again for a second (40 slots total).")
         end
 
@@ -5101,11 +7078,12 @@ function ui.overview()
             else
                 -- Same button either way; only the label changes. A second satchel is reachable
                 -- because the step's guard checks INVENTORY, not the bank - see runLysricStep.
-                local label = satchelDone and "Hail Lysric again###lysricRun" or "Hail Lysric###lysricRun"
+                local again = satchelDone and not lost   -- v2.66: a replacement is a first hail, not a second
+                local label = again and "Hail Lysric again###lysricRun" or "Hail Lysric###lysricRun"
                 if activeSection == "lysric" then pushAttention() end
                 if imgui.Button(label) then lysricRequested = true end
                 if activeSection == "lysric" then popAttention() end
-                if satchelDone and imgui.IsItemHovered() then
+                if again and imgui.IsItemHovered() then
                     imgui.SetTooltip("You've hailed once, yes....but what about Second Hail?"
                         .. "\n\nBank your current satchel first - Lore blocks a second one in the same"
                         .. " inventory. With it banked, hailing again grants another (40 slots in total).")
@@ -5232,11 +7210,282 @@ function ui.deliveries()
                             imgui.SetTooltip("Put the letter on your cursor first, then click.\nConfirms you are holding it, so the row reads 'In hand'.")
                         end
                     end
+                elseif not state.postmasterDone and not pmBusy then
+                    -- v2.65 (AL): "Done" is saved to disk, so a row marked only to make the next batch skip it
+                    -- (a quick way to send the run somewhere for a test) stayed delivered for good - and Aric
+                    -- will not finish a Challenge with a letter never really handed in. Undo puts it back.
+                    -- Hidden while a batch runs (it read the list at its start) and once Aric has signed off.
+                    imgui.SameLine(nameX + ui.rowNameW() + 12)
+                    if imgui.SmallButton("Undo##u" .. i) then
+                        state.deliveries[i] = false
+                        saveState()
+                    end
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip("Put this row back to Awaiting.\nFor a row you marked Done yourself. A letter really handed in counts\nonce - the sender may not give it again.")
+                    end
                 end
                 imgui.SameLine(imgui.GetWindowWidth() - imgui.CalcTextSize(status) - 28)
                 coloredText(sr, sg, sb, status)
             end
             imgui.Unindent(12)
+        end
+    end
+end
+
+-- The Faction tab (v2.29): one section per helper quest. Everything here only READS and sets request
+-- flags - the reading, buying and walking all happen in the main loop, because the render thread must
+-- never wait.
+function ui.factionRow(label, value)
+    imgui.TextDisabled(label)
+    imgui.SameLine(96)
+    imgui.TextWrapped(value)
+end
+
+-- One colour per tier, worst to best (v2.30, AL: "colorize the faction bar"). The bad end follows the
+-- game's own Faction window - Scowls red, Threatening pink-red, Dubious yellow, Apprehensive grey,
+-- Indifferent white (AL's screenshot) - so the strip reads the way the player already knows; the good end
+-- runs through greens to a blue Ally.
+ui.tierColors = {
+    { 205, 55, 50 }, { 220, 110, 100 }, { 215, 185, 60 }, { 150, 150, 150 }, { 225, 225, 225 },
+    { 150, 205, 120 }, { 95, 185, 95 }, { 55, 160, 115 }, { 80, 150, 230 },
+}
+
+-- The nine tiers as a strip, worst on the left. Tiers you have reached are solid, the rest faint, so the
+-- whole scale is always readable; where you stand gets a white edge, the goal a gold one. Hovering names
+-- the tier under the mouse.
+function ui.factionLadder(word, goal)
+    local dl = imgui.GetWindowDrawList()
+    local x, y = imgui.GetCursorScreenPos()
+    local w = imgui.GetWindowWidth() - imgui.GetCursorPosX() - 8
+    local n, gap, h = #faction.tiers, 3, 12
+    local seg = (w - gap * (n - 1)) / n
+    local now, want = faction.rank(word) or 0, faction.rank(goal) or 0
+    for k = 1, n do
+        local x0 = x + (k - 1) * (seg + gap)
+        local c = ui.tierColors[k]
+        dl:AddRectFilled(ImVec2(x0, y), ImVec2(x0 + seg, y + h), IM_COL32(c[1], c[2], c[3], k <= now and 255 or 45), 3)
+        if k == now then dl:AddRect(ImVec2(x0, y), ImVec2(x0 + seg, y + h), IM_COL32(255, 255, 255, 210), 3) end
+        if k == want then dl:AddRect(ImVec2(x0 - 1, y - 1), ImVec2(x0 + seg + 1, y + h + 1), IM_COL32(242, 199, 84, 255), 3) end
+    end
+    imgui.Dummy(w, h)
+    if imgui.IsItemHovered() then
+        local mx = imgui.GetMousePos()   -- two plain numbers; only x is needed
+        local k = math.max(1, math.min(n, math.floor((mx - x) / (seg + gap)) + 1))
+        imgui.SetTooltip(faction.tiers[k] .. (k == now and "  - where you stand" or "")
+            .. (k == want and "  - your Stop at goal" or ""))
+    end
+end
+
+function ui.pushButtonColor(r, g, b)
+    imgui.PushStyleColor(ImGuiCol.Button, r, g, b, 1)
+    imgui.PushStyleColor(ImGuiCol.ButtonHovered, r * 1.25, g * 1.25, b * 1.25, 1)
+    imgui.PushStyleColor(ImGuiCol.ButtonActive, r * 1.5, g * 1.5, b * 1.5, 1)
+end
+
+function ui.faction()
+    imgui.PushStyleColor(ImGuiCol.Text, 0.56, 0.52, 0.45, 1)
+    imgui.TextWrapped("Quests that raise a faction by handing an NPC something you can buy, or coin. Each one runs"
+        .. " on its own, apart from the courier quest.")
+    imgui.PopStyleColor()
+    local otherBusy = nonadBusy or pmBusy or lysricBusy or traveling
+    for i, h in ipairs(faction.helpers) do
+        local r = faction.reads[h.key] or {}
+        imgui.SetNextItemOpen(true, ImGuiCond.FirstUseEver)
+        if imgui.CollapsingHeader(string.format("%s  -  %s%s###factionHelper%d", h.title, h.faction,
+            r.word and ("   (" .. r.word .. ")") or "", i)) then
+            imgui.Indent(6)
+            ui.factionRow("Needed for", h.neededFor)
+            if h.coin then
+                ui.factionRow("Give", string.format("%d %s at a time, one trade each - no shop. Short of %s, the PoK"
+                    .. " bank makes change from platinum.", h.perGive, h.unit, h.unit))
+            elseif h.loop then
+                ui.factionRow("Buy", string.format("%s - %s, beside him, as it goes (%s in PoK sells it too)",
+                    h.item, h.shop, h.vendor))
+                ui.factionRow("Give", string.format("%d at a time, one trade each; the %s he hands back is destroyed"
+                    .. " (it is Lore and blocks the next).", h.perTrade, h.destroy))
+            else
+                ui.factionRow("Buy", string.format("%s - %s, %s", h.item, h.vendor, h.vendorWhere))
+            end
+            ui.factionRow("Give to", string.format("%s - %s", h.npc, h.npcWhere))
+            ui.factionRow("Also raises", h.raises)
+            ui.factionRow("Lowers", h.lowers)
+            imgui.Spacing()
+            local goal = faction.goalFor(h)
+            ui.factionLadder(r.word, goal)
+            if r.word then
+                local line = string.format("Now %s, earned standing %s", r.word, r.standing and tostring(r.standing) or "?")
+                if (faction.rank(r.word) or 0) >= (faction.rank(goal) or 99) then
+                    coloredText(0.45, 0.85, 0.45, line .. " - at your goal.")
+                else
+                    local need = faction.estimate(h, r.standing, goal)
+                    coloredText(0.90, 0.87, 0.80, line .. (need and string.format(" - about %d %s to go.", need,
+                        h.item or h.unit) or "."))
+                end
+            else
+                imgui.TextDisabled("Not read yet - Check reads it from your Faction window.")
+            end
+            -- v2.58, the coin helper: below Indifferent Fabian's own quest will not deal - Run goes in the mask.
+            if h.coin and r.word and (faction.rank(r.word) or 0) < faction.rank("Indifferent") then
+                imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.82, 0.35, 1)
+                imgui.TextWrapped(string.format("%s's quest deals only with %s Indifferent - so Run goes to him in the"
+                    .. " Sneak mask: a sneaking character reads Indifferent to him, and his quest believes it. A Rogue"
+                    .. " sneaks as themselves; an evil race from level 5 takes a Goblin Rogue shroud.", h.npc, h.faction))
+                imgui.PopStyleColor()
+            end
+            if h.dangerNpc and faction.hostile(r.danger) then
+                -- v2.60: the danger stands IN THE ROOM - close up, a hostile NPC sees through Sneak.
+                imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.45, 0.35, 1)
+                imgui.TextWrapped(string.format("%s: %s. %s stands in %s's room, close enough to see through Sneak -"
+                    .. " run %s first. Run stops here until then.", h.danger, r.danger, h.dangerNpc, h.npc, h.dangerFix))
+                imgui.PopStyleColor()
+            elseif faction.hostile(r.danger) then
+                imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.45, 0.35, 1)
+                imgui.TextWrapped(string.format("%s: %s. The guards on the way attack you on sight%s.", h.danger,
+                    r.danger, faction.hostile(r.npcWord) and " - so Run goes to " .. h.npc .. " shrouded and hidden"
+                        or (h.coin and " - so Run goes to " .. h.npc .. " in the Sneak mask, whatever the bards read"
+                            or (h.meet and " - so Run waits by the PoK book and meets " .. h.npc .. " out in the field, away from them"
+                                -- v2.59: a hostile danger with no meeting spot takes the shrouded one-trip path
+                                or " - so Run buys them as you, banks them, and takes them to " .. h.npc
+                                    .. " in a Goblin Rogue shroud, hidden, in one trade"))))
+                imgui.PopStyleColor()
+            end
+            if faction.hostile(r.npcWord) then
+                imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.45, 0.35, 1)
+                -- What Run will actually DO about it, for this character (v2.37, one trip since v2.41).
+                local lvl = mq.TLO.Me.Level() or 0
+                local plan = (h.loop and (mq.TLO.Me.Class.ShortName() or "") == "ROG"
+                        and "Run sneaks up behind him as yourself and hands them over from there.")
+                    or (factionRisk and lvl >= 5 and lvl < tuning.shroudLevel and h.loop
+                        and "Run takes a Goblin Rogue shroud (your coins go with you), buys them beside him, and hands"
+                            .. " them over from his back.")
+                    or (factionRisk and lvl >= 5 and lvl < tuning.shroudLevel
+                        and "Run buys them all as you, banks them, takes a Goblin Rogue shroud, and hands them all"
+                            .. " over in one trip.")
+                    or (lvl < 5 and "that needs a Goblin Rogue shroud, from level 5 - Run stops before buying.")
+                    or "take a Goblin Rogue shroud first (Shroudkeeper Hyush, PoK) - Run stops before buying."
+                imgui.TextWrapped(string.format("%s: %s. %s attacks you on sight, so the items can only be handed"
+                    .. " over while hidden - %s", h.npcFaction, r.npcWord, h.npc, plan))
+                imgui.PopStyleColor()
+            end
+            -- v2.41: a shroud empties the Faction window, and it stays empty after "remove" until a camp.
+            if mq.TLO.Me.Shrouded() and faction.active ~= i then
+                imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.82, 0.35, 1)
+                local p = faction.plan
+                if (h.coin or h.loop) and p and p.key == h.key and p.need > 0 then
+                    -- v2.63: a run sized as yourself carries on in the shroud
+                    imgui.TextWrapped(string.format("You are shrouded. Run carries on the run you started as yourself -"
+                        .. " about %d %s left. Check needs you as yourself (Unshroud, then camp).", p.need, h.item or h.unit))
+                else
+                    imgui.TextWrapped("You are shrouded. Run and Check need you as yourself: press Unshroud, then camp to"
+                        .. " character select and come back - EQ keeps your Faction window empty after a shroud until you do.")
+                end
+                imgui.PopStyleColor()
+            end
+
+            imgui.TextDisabled("Stop at")
+            imgui.SameLine()
+            imgui.SetNextItemWidth(140)
+            if imgui.BeginCombo("##factionGoal" .. i, goal) then
+                for _, g in ipairs(faction.goals) do
+                    -- v2.61: MQ's Selectable returns (selected, PRESSED) - lua_ImGuiWidgets.cpp. Testing the first
+                    -- fired every frame for the CURRENT goal and set it back (AL: "stuck on Kindly"), saving each frame.
+                    local _, pressed = imgui.Selectable(g, g == goal)
+                    if pressed then
+                        state.factionGoals[h.key] = g   -- v2.58: each helper keeps its own
+                        saveState()
+                    end
+                end
+                imgui.EndCombo()
+            end
+            if imgui.IsItemHovered() then
+                if h.goalTip then
+                    imgui.SetTooltip(h.goalTip)
+                elseif h.coin then
+                    imgui.SetTooltip("The reaction to stop at. Indifferent is what Fabian's own quest asks for;\nAlly"
+                        .. " makes every bard in the Postmaster's Challenge friendly.\n\nThe gold is sized to it, and never"
+                        .. " past the +2,000 earned\nstanding - past that a give earns nothing.")
+                else
+                    imgui.SetTooltip("The reaction to stop at. Apprehensive is what Vicus Nonad\nneeds before he will give you the Taxes."
+                        .. "\n\nKindly, Warmly and Ally: the item estimate is on the safe\nside, so a run may buy a few more than it uses."
+                        .. " It still\nstops the moment the reaction reads your goal.")
+                end
+            end
+
+            if faction.last == i and faction.status ~= "" then
+                coloredText(0.95, 0.82, 0.35, faction.status)
+                if faction.given > 0 then
+                    imgui.TextDisabled(string.format("%d %s handed over this run.", faction.given, h.item or h.unit))
+                end
+            end
+
+            if faction.active == i then
+                if automation.paused then
+                    ui.pushButtonColor(0.18, 0.35, 0.14)
+                    if imgui.Button("Continue##factionGo" .. i) then
+                        automation.paused = false
+                        if mq.TLO.Navigation.Paused() then mq.cmd('/nav pause off') end
+                    end
+                else
+                    ui.pushButtonColor(0.36, 0.27, 0.07)
+                    if imgui.Button("Pause##factionPause" .. i) then
+                        automation.paused = true
+                        if mq.TLO.Navigation.Active() then mq.cmd('/nav pause') end
+                    end
+                end
+                imgui.PopStyleColor(3)
+                imgui.SameLine()
+                ui.pushButtonColor(0.42, 0.14, 0.13)
+                if imgui.Button("Stop##factionStop" .. i) then
+                    automation.stop = true
+                    automation.paused = false
+                end
+                imgui.PopStyleColor(3)
+            elseif faction.active or otherBusy then
+                imgui.TextDisabled("Another run is going - this one waits until it finishes.")
+            else
+                ui.pushButtonColor(0.18, 0.35, 0.14)
+                if imgui.Button("Run##factionRun" .. i) then
+                    faction.last, faction.status, faction.given = i, "Starting...", 0
+                    faction.request = i
+                end
+                imgui.PopStyleColor(3)
+                if imgui.IsItemHovered() then
+                    if h.coin then
+                        imgui.SetTooltip(string.format("Sorts out the %s your Stop at needs (the PoK bank makes change"
+                            .. " from platinum),\ntakes it to %s and hands it over %d at a time until %s reaches it.\nStarts"
+                            .. " as yourself, never in a shroud.\nPause and Stop appear once it is running.", h.unit, h.npc,
+                            h.perGive, h.faction))
+                    elseif h.loop then
+                        imgui.SetTooltip(string.format("Goes to %s and hands over %s %d at a time,\nbuying it from %s"
+                            .. " beside him as it goes, until %s\nreaches your Stop at. Starts as yourself; in a shroud, Run"
+                            .. "\ncarries on a run you started. Pause and Stop appear once it is running.",
+                            h.npc, h.item, h.perTrade, h.shop, h.faction))
+                    else
+                        imgui.SetTooltip(string.format("Buys the %s your Stop at reaction needs, takes them to %s,\nand"
+                            .. " repeats until %s reaches it. Starts as yourself,\nnever in a shroud.\nPause and Stop appear"
+                            .. " once it is running.", h.item, h.npc, h.faction))
+                    end
+                end
+                imgui.SameLine()
+                if imgui.Button("Check##factionCheck" .. i) then faction.check = i end
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip("Reads where you stand from your Faction window - no travel.")
+                end
+                if mq.TLO.Me.Shrouded() then
+                    imgui.SameLine()
+                    ui.pushButtonColor(0.28, 0.20, 0.36)
+                    if imgui.Button("Unshroud##factionUnshroud" .. i) then
+                        faction.last, faction.status, faction.given = i, "Starting...", 0
+                        faction.unshroud = i
+                    end
+                    imgui.PopStyleColor(3)
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip("Goes to Shroudkeeper Hyush in PoK and says \"remove\".\nThen camp to character"
+                            .. " select and come back -\nEQ keeps your Faction window empty until you do.")
+                    end
+                end
+            end
+            imgui.Unindent(6)
         end
     end
 end
@@ -5249,7 +7498,8 @@ function ui.settings()
     imgui.SetNextItemWidth(220)
     if imgui.BeginCombo("##pmtheme", state.theme) then
         for _, name in ipairs(ui.THEME_NAMES) do
-            if imgui.Selectable(name, name == state.theme) then
+            local _, pressed = imgui.Selectable(name, name == state.theme)   -- v2.61: (selected, pressed)
+            if pressed then
                 state.theme = name
                 saveState()
             end
@@ -5282,6 +7532,18 @@ function ui.settings()
             .. "character gets stuck\nclimbing over. This sets you to MQ2AutoSize size 4\nwhile Postmaster is "
             .. "running - the size that got over\ncleanly in testing.\n\nIf you don't use MQ2AutoSize, Postmaster loads it\nfor the run and "
             .. "unloads it after. If you do, your\nown settings are saved first and put back.")
+    end
+    -- Only a character the Shroud Strategy applies to sees the box (v2.46).
+    if factionRisk and (mq.TLO.Me.Level() or 0) < tuning.shroudLevel then
+        local beforeShroud = state.autoShroud
+        state.autoShroud = imgui.Checkbox("Shroud for the courier runs", state.autoShroud)
+        if state.autoShroud ~= beforeShroud then saveState() end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip("Takes a level-matched Goblin Rogue shroud from\nShroudkeeper Hyush before the courier and "
+                .. "Nonad runs,\nthen sneaks and hides past guards that attack\nyour race on sight.\n\nOff: you travel "
+                .. "as yourself. Fix a faction first\non the Faction tab if its guards are the problem.\n\nA shroud "
+                .. "empties your Faction window until you\ncamp to character select and come back.")
+        end
     end
 
     imgui.Separator()
@@ -5392,6 +7654,10 @@ function ui.help()
             .. "character for a second: 40 slots in total.",
         "High Keep's gnoll pack has killed low-level characters repeatedly, even with a speed buff. "
             .. "A pet soaking the aggro is what actually worked.",
+        "Vicus Nonad will not talk to you? Your Antonius Bayle faction is too low. The Faction tab's "
+            .. "Bone Chips run raises it - Dark Elves, Trolls, Ogres and Iksar start low there.",
+        "A shroud empties EQ's Faction window, and it stays empty after you remove the shroud until you "
+            .. "camp to character select and come back. The Faction tab's Run and Check need you as yourself.",
         "Hover almost anything - buttons, statuses and counts explain themselves.",
     }) do
         imgui.Bullet()
@@ -5445,6 +7711,7 @@ local function renderUI()
         if imgui.BeginTabBar("##pmtabs") then
             ui.tab("Overview",   "##ovbody", ui.overview)
             ui.tab("Deliveries", "##dlbody", ui.deliveries)
+            ui.tab("Faction",    "##fcbody", ui.faction)
             ui.tab("Settings",   "##stbody", ui.settings)
             ui.tab("Help",       "##hpbody", ui.help)
             imgui.EndTabBar()
@@ -5520,6 +7787,17 @@ while running do
         print('\ag[Postmaster]\ax no longer shrouded - back to normal form.')
     end
     lastShroudedState = nowShrouded
+    -- v2.61: WHO YOU ARE is read as yourself, never from a shroud. myRace was read once at start - and a script
+    -- started in a shroud read the MONSTER ("Goblin"): the Emerald Warriors estimate lost an Iksar's -1,000 (AL:
+    -- "about 0 Red Wine to go" at Dubious, and a run that would not start), and factionRisk read false. Re-read here
+    -- whenever unshrouded - the script stays open through a camp, so a restart is not needed any more.
+    if not nowShrouded then
+        local race = mq.TLO.Me.Race()
+        if race and race ~= "" and race ~= myRace then
+            myRace = race
+            factionRisk = myRace == "Dark Elf" or myRace == "Troll" or myRace == "Ogre" or myRace == "Iksar"
+        end
+    end
     if fit.request ~= nil then
         local want = fit.request
         fit.request = nil
@@ -5544,6 +7822,28 @@ while running do
     if lysricRequested then
         lysricRequested = false
         runLysricStep()
+    end
+    if faction.check then
+        local i = faction.check
+        faction.check = nil
+        faction.refresh(faction.helpers[i])
+        if faction.empty then
+            faction.last, faction.given = i, 0
+            faction.status = "Can't read it: " .. faction.emptyWhy() .. "."
+            print('\ay[Postmaster]\ax ' .. faction.status)
+        elseif faction.last == i and not faction.active then
+            faction.status = ""   -- a good read replaces an old "can't read it" line
+        end
+    end
+    if faction.unshroud then
+        local i = faction.unshroud
+        faction.unshroud = nil
+        faction.unshroudNow(i)
+    end
+    if faction.request then
+        local i = faction.request
+        faction.request = nil
+        faction.run(i)
     end
     if syncHeldIdx then
         local idx = syncHeldIdx
